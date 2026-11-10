@@ -8,9 +8,20 @@
 #import <netinet/in.h>
 #import <unistd.h>
 #import <MediaToolbox/MediaToolbox.h>
+#import <PhotosUI/PhotosUI.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
-#define PC_DIR @"/var/tmp/PrankCam"   // mets tes videos ici
+static NSString *PCDirPath(void) {   // dossier prive de l'app courante
+  static NSString *p; static dispatch_once_t o;
+  dispatch_once(&o, ^{
+    p = [[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject
+          stringByAppendingPathComponent:@"PrankCam"] copy];
+    [[NSFileManager defaultManager] createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+  });
+  return p;
+}
+#define PC_DIR PCDirPath()
 #define PC_WM  @"LIVE PRANK"
 #define PC_PORT 8765
 #define RING_N (1<<18)
@@ -33,6 +44,11 @@
 - (void)pushABL:(AudioBufferList *)abl frames:(UInt32)n;
 - (void)tapRate:(double)r ch:(UInt32)c nonInter:(BOOL)ni;
 - (void)flush;
+- (void)load:(NSString *)f;
+- (void)saveCues;
+- (void)jumpCue:(NSString *)n;
+- (void)markCue:(NSString *)n;
+- (void)deleteCue:(NSString *)n;
 - (CMSampleBufferRef)replace:(CMSampleBufferRef)sb CF_RETURNS_RETAINED;
 - (void)replaceAudio:(CMSampleBufferRef)sb;
 @end
@@ -112,6 +128,22 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   }
   if (have) _rp += fr * ratio;
   os_unfair_lock_unlock(&_lock);
+}
+- (void)jumpCue:(NSString *)n {
+  NSNumber *t = ((NSDictionary *)self.cues[self.current ?: @""])[n];
+  if (!t || !self.player) return;
+  [self.player seekToTime:CMTimeMakeWithSeconds(t.doubleValue, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+  [self flush]; [self.player play];
+}
+- (void)markCue:(NSString *)n {
+  if (!self.current || !n.length) return;
+  NSMutableDictionary *m = self.cues[self.current] ?: [NSMutableDictionary new];
+  double t = CMTimeGetSeconds(self.player.currentTime); if (!(t > 0)) t = 0;
+  m[n] = @(t); self.cues[self.current] = m; [self saveCues];
+}
+- (void)deleteCue:(NSString *)n {
+  if (!self.current) return;
+  [(NSMutableDictionary *)self.cues[self.current] removeObjectForKey:n]; [self saveCues];
 }
 - (void)load:(NSString *)f {
   NSString *p = [PC_DIR stringByAppendingPathComponent:f.lastPathComponent];
@@ -276,6 +308,313 @@ r();setInterval(r,2000)
 }
 @end
 
+// ---------- 2 boutons flottants : telecommande + parametres ----------
+@interface PCWindow : UIWindow
+@end
+@implementation PCWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+  UIView *v = [super hitTest:p withEvent:e];
+  return (v == self || v == self.rootViewController.view) ? nil : v;   // laisse passer les touches vers l'app
+}
+@end
+
+static UILabel *PCLabel(NSString *t, CGFloat sz, BOOL bold) {
+  UILabel *l = [UILabel new]; l.text = t; l.textColor = UIColor.whiteColor; l.numberOfLines = 0;
+  l.font = bold ? [UIFont boldSystemFontOfSize:sz] : [UIFont systemFontOfSize:sz];
+  return l;
+}
+static UIButton *PCBtn(NSString *t, id target, SEL sel) {
+  UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+  [b setTitle:t forState:UIControlStateNormal]; [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+  b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1]; b.layer.cornerRadius = 8;
+  [b.heightAnchor constraintEqualToConstant:36].active = YES;
+  [b addTarget:target action:sel forControlEvents:UIControlEventTouchUpInside];
+  return b;
+}
+static UIView *PCRow(NSString *t, UISwitch *sw) {
+  UIStackView *r = [UIStackView new]; r.axis = UILayoutConstraintAxisHorizontal; r.alignment = UIStackViewAlignmentCenter;
+  [r addArrangedSubview:PCLabel(t, 15, NO)]; [r addArrangedSubview:sw];
+  return r;
+}
+static NSString *PCTime(double t) { int s = (int)t; return [NSString stringWithFormat:@"%d:%02d", s / 60, s % 60]; }
+
+@interface PCUI : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@property (nonatomic, strong) PCWindow *win;
+@property (nonatomic, strong) UIButton *fab;       // telecommande
+@property (nonatomic, strong) UIButton *gear;      // parametres (appui long)
+@property (nonatomic, strong) UIButton *dot;       // petit point quand les boutons sont caches
+@property (nonatomic, strong) UIView *remote;
+@property (nonatomic, strong) UIView *settings;
+@property (nonatomic, strong) UIStackView *cueStack;
+@property (nonatomic, strong) UIButton *vidBtn;
+@property (nonatomic, strong) UISlider *slider;
+@property (nonatomic, strong) UILabel *timeLbl;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, strong) UIWindow *prevKey;
++ (instancetype)shared;
+- (void)install;
+@end
+
+@implementation PCUI
++ (instancetype)shared {
+  static PCUI *u; static dispatch_once_t o;
+  dispatch_once(&o, ^{ u = [PCUI new]; });
+  return u;
+}
+- (UIButton *)roundBtn:(NSString *)t y:(CGFloat)y {
+  UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+  b.frame = CGRectMake(16, y, 48, 48); b.layer.cornerRadius = 24;
+  b.backgroundColor = [UIColor colorWithRed:0.16 green:0.43 blue:0.96 alpha:0.9];
+  [b setTitle:t forState:UIControlStateNormal]; b.titleLabel.font = [UIFont systemFontOfSize:24];
+  [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+  return b;
+}
+- (void)install {
+  if (self.win) return;
+  UIWindowScene *sc = nil;
+  for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+    if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene *)s; break; }
+  }
+  if (!sc) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [self install]; });
+    return;
+  }
+  PCWindow *w = [[PCWindow alloc] initWithWindowScene:sc];
+  w.windowLevel = UIWindowLevelAlert + 100; w.backgroundColor = UIColor.clearColor;
+  UIViewController *vc = [UIViewController new]; vc.view.backgroundColor = UIColor.clearColor;
+  w.rootViewController = vc; w.hidden = NO; self.win = w;
+  // bouton 1 : telecommande (tap = ouvrir ; appui long = cacher les boutons)
+  self.fab = [self roundBtn:@"🎬" y:150];
+  [self.fab addTarget:self action:@selector(toggleRemote) forControlEvents:UIControlEventTouchUpInside];
+  [self.fab addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(fabHold:)]];
+  // bouton 2 : parametres (appui long pour ouvrir)
+  self.gear = [self roundBtn:@"⚙️" y:206];
+  UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(gearHold:)];
+  lp.minimumPressDuration = 0.6;
+  [self.gear addGestureRecognizer:lp];
+  // petit point : reapparition des boutons
+  UIButton *d = [UIButton buttonWithType:UIButtonTypeCustom];
+  d.frame = CGRectMake(16, 150, 22, 22); d.layer.cornerRadius = 11;
+  d.backgroundColor = [UIColor colorWithWhite:1 alpha:0.3]; d.hidden = YES;
+  [d addTarget:self action:@selector(showButtons) forControlEvents:UIControlEventTouchUpInside];
+  self.dot = d;
+  [vc.view addSubview:self.fab]; [vc.view addSubview:self.gear]; [vc.view addSubview:d];
+}
+- (void)drag:(UIPanGestureRecognizer *)g {
+  UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
+  v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+  [g setTranslation:CGPointZero inView:v.superview];
+}
+- (void)fabHold:(UILongPressGestureRecognizer *)g {
+  if (g.state != UIGestureRecognizerStateBegan) return;
+  [self closePanels];
+  self.dot.center = self.fab.center;
+  self.fab.hidden = YES; self.gear.hidden = YES; self.dot.hidden = NO;
+}
+- (void)showButtons { self.dot.hidden = YES; self.fab.hidden = NO; self.gear.hidden = NO; }
+- (void)gearHold:(UILongPressGestureRecognizer *)g {
+  if (g.state != UIGestureRecognizerStateBegan) return;
+  BOOL wasOpen = (self.settings != nil);
+  [self closePanels];
+  if (!wasOpen) [self buildSettings];
+}
+- (void)toggleRemote {
+  BOOL wasOpen = (self.remote != nil);
+  [self closePanels];
+  if (!wasOpen) [self buildRemote];
+}
+- (void)closePanels {
+  [self.timer invalidate]; self.timer = nil;
+  [self.remote removeFromSuperview]; self.remote = nil;
+  [self.settings removeFromSuperview]; self.settings = nil;
+  self.cueStack = nil; self.slider = nil; self.timeLbl = nil; self.vidBtn = nil;
+}
+- (UIStackView *)newPanel:(UIView **)out {
+  UIView *host = self.win.rootViewController.view;
+  UIView *p = [UIView new]; p.translatesAutoresizingMaskIntoConstraints = NO;
+  p.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95]; p.layer.cornerRadius = 16;
+  UIStackView *st = [UIStackView new]; st.axis = UILayoutConstraintAxisVertical; st.spacing = 8;
+  st.translatesAutoresizingMaskIntoConstraints = NO;
+  [p addSubview:st]; [host addSubview:p];
+  [NSLayoutConstraint activateConstraints:@[
+    [st.leadingAnchor constraintEqualToAnchor:p.leadingAnchor constant:12],
+    [st.trailingAnchor constraintEqualToAnchor:p.trailingAnchor constant:-12],
+    [st.topAnchor constraintEqualToAnchor:p.topAnchor constant:12],
+    [st.bottomAnchor constraintEqualToAnchor:p.bottomAnchor constant:-12],
+    [p.widthAnchor constraintEqualToConstant:300],
+    [p.centerXAnchor constraintEqualToAnchor:host.centerXAnchor],
+    [p.topAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.topAnchor constant:56]]];
+  *out = p;
+  return st;
+}
+// ----- panneau PARAMETRES -----
+- (void)buildSettings {
+  PCEngine *E = [PCEngine shared];
+  UIView *p = nil; UIStackView *st = [self newPanel:&p];
+  [st addArrangedSubview:PCLabel(@"Paramètres", 18, YES)];
+  UISwitch *s1 = [UISwitch new]; s1.on = E.enabled;
+  [s1 addTarget:self action:@selector(swEnable:) forControlEvents:UIControlEventValueChanged];
+  [st addArrangedSubview:PCRow(@"Activer le tweak", s1)];
+  UISwitch *s2 = [UISwitch new]; s2.on = E.audioOn;
+  [s2 addTarget:self action:@selector(swAudio:) forControlEvents:UIControlEventValueChanged];
+  [st addArrangedSubview:PCRow(@"Son de la vidéo", s2)];
+  [st addArrangedSubview:PCBtn(@"Ajouter une vidéo (Photos)", self, @selector(addPhotos))];
+  [st addArrangedSubview:PCBtn(@"Ajouter une vidéo (Fichiers)", self, @selector(addFiles))];
+  self.vidBtn = PCBtn(E.current ?: @"Choisir une vidéo", self, @selector(chooseVideo));
+  [st addArrangedSubview:self.vidBtn];
+  UILabel *h = PCLabel(@"Le filigrane LIVE PRANK reste toujours affiché. Appui long sur 🎬 = cacher les boutons.", 11, NO);
+  h.textColor = [UIColor colorWithWhite:0.7 alpha:1]; [st addArrangedSubview:h];
+  [st addArrangedSubview:PCBtn(@"Fermer", self, @selector(closePanels))];
+  self.settings = p;
+}
+// ----- panneau TELECOMMANDE -----
+- (void)buildRemote {
+  UIView *p = nil; UIStackView *st = [self newPanel:&p];
+  [st addArrangedSubview:PCLabel(@"Télécommande", 18, YES)];
+  self.timeLbl = PCLabel(@"Aucune vidéo : ouvre les paramètres (⚙️, appui long)", 12, NO);
+  [st addArrangedSubview:self.timeLbl];
+  UISlider *sl = [UISlider new]; sl.minimumValue = 0; sl.maximumValue = 1;
+  [sl addTarget:self action:@selector(scrub:) forControlEvents:UIControlEventValueChanged];
+  self.slider = sl; [st addArrangedSubview:sl];
+  UIStackView *ctl = [UIStackView new]; ctl.axis = UILayoutConstraintAxisHorizontal;
+  ctl.spacing = 6; ctl.distribution = UIStackViewDistributionFillEqually;
+  [ctl addArrangedSubview:PCBtn(@"-5s", self, @selector(back5))];
+  [ctl addArrangedSubview:PCBtn(@"Play/Pause", self, @selector(playPause))];
+  [ctl addArrangedSubview:PCBtn(@"+5s", self, @selector(fwd5))];
+  [st addArrangedSubview:ctl];
+  [st addArrangedSubview:PCBtn(@"Ajouter ce temps (donner un nom)", self, @selector(markHere))];
+  UIScrollView *sv = [UIScrollView new]; sv.translatesAutoresizingMaskIntoConstraints = NO;
+  [sv.heightAnchor constraintEqualToConstant:150].active = YES;
+  UIStackView *cs = [UIStackView new]; cs.axis = UILayoutConstraintAxisVertical; cs.spacing = 6;
+  cs.translatesAutoresizingMaskIntoConstraints = NO; [sv addSubview:cs];
+  [NSLayoutConstraint activateConstraints:@[
+    [cs.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor],
+    [cs.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor],
+    [cs.leadingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.leadingAnchor],
+    [cs.trailingAnchor constraintEqualToAnchor:sv.contentLayoutGuide.trailingAnchor],
+    [cs.widthAnchor constraintEqualToAnchor:sv.frameLayoutGuide.widthAnchor]]];
+  [st addArrangedSubview:sv];
+  UILabel *h = PCLabel(@"Glisse le curseur pour choisir le moment, puis ajoute-le. Tap sur un temps = saut direct. Appui long = supprimer.", 11, NO);
+  h.textColor = [UIColor colorWithWhite:0.7 alpha:1]; [st addArrangedSubview:h];
+  [st addArrangedSubview:PCBtn(@"Fermer", self, @selector(closePanels))];
+  self.cueStack = cs; self.remote = p;
+  [self reloadCues];
+  [self tick];
+  self.timer = [NSTimer scheduledTimerWithTimeInterval:0.4 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+- (void)tick {
+  PCEngine *E = [PCEngine shared];
+  if (!E.player || !self.slider) return;
+  double dur = CMTimeGetSeconds(E.player.currentItem.asset.duration); if (!(dur > 0)) dur = 1;
+  double cur = CMTimeGetSeconds(E.player.currentTime); if (!(cur > 0)) cur = 0;
+  self.slider.maximumValue = dur;
+  if (!self.slider.isTracking) self.slider.value = cur;
+  self.timeLbl.text = [NSString stringWithFormat:@"%@ / %@   %@", PCTime(cur), PCTime(dur), E.current ?: @""];
+}
+- (void)scrub:(UISlider *)s {
+  PCEngine *E = [PCEngine shared]; if (!E.player) return;
+  [E.player pause];
+  [E.player seekToTime:CMTimeMakeWithSeconds(s.value, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+  [E flush];
+}
+- (void)reloadCues {
+  if (!self.cueStack) return;
+  for (UIView *v in [self.cueStack.arrangedSubviews copy]) { [self.cueStack removeArrangedSubview:v]; [v removeFromSuperview]; }
+  PCEngine *E = [PCEngine shared];
+  NSDictionary *m = E.current ? E.cues[E.current] : nil;
+  NSArray *names = [m.allKeys sortedArrayUsingComparator:^NSComparisonResult(id a, id b) { return [m[a] compare:m[b]]; }];
+  for (NSString *n in names) {
+    UIButton *b = PCBtn([NSString stringWithFormat:@"%@  (%@)", n, PCTime([m[n] doubleValue])], self, @selector(cueTap:));
+    b.accessibilityIdentifier = n; b.backgroundColor = [UIColor colorWithRed:0.16 green:0.43 blue:0.96 alpha:1];
+    [b addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(cueHold:)]];
+    [self.cueStack addArrangedSubview:b];
+  }
+}
+- (void)cueTap:(UIButton *)b { [[PCEngine shared] jumpCue:b.accessibilityIdentifier]; }
+- (void)cueHold:(UILongPressGestureRecognizer *)g {
+  if (g.state != UIGestureRecognizerStateBegan) return;
+  NSString *n = g.view.accessibilityIdentifier;
+  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Supprimer ce temps ?" message:n preferredStyle:UIAlertControllerStyleAlert];
+  [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+  [a addAction:[UIAlertAction actionWithTitle:@"Supprimer" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+    [[PCEngine shared] deleteCue:n]; [self reloadCues]; }]];
+  [self.win.rootViewController presentViewController:a animated:YES completion:nil];
+}
+- (void)swEnable:(UISwitch *)s { [PCEngine shared].enabled = s.on; }
+- (void)swAudio:(UISwitch *)s { [PCEngine shared].audioOn = s.on; }
+- (void)back5 { [self seekBy:-5]; }
+- (void)fwd5 { [self seekBy:5]; }
+- (void)seekBy:(double)d {
+  PCEngine *E = [PCEngine shared]; if (!E.player) return;
+  double t = CMTimeGetSeconds(E.player.currentTime) + d; if (!(t > 0)) t = 0;
+  [E.player seekToTime:CMTimeMakeWithSeconds(t, 600)]; [E flush];
+}
+- (void)playPause {
+  PCEngine *E = [PCEngine shared]; if (!E.player) return;
+  if (E.player.rate > 0) [E.player pause]; else [E.player play];
+}
+- (void)markHere {
+  PCEngine *E = [PCEngine shared]; if (!E.current) return;
+  NSString *def = [NSString stringWithFormat:@"Temps %lu", (unsigned long)(((NSDictionary *)E.cues[E.current]).count + 1)];
+  self.prevKey = nil;
+  for (UIWindow *w in self.win.windowScene.windows) if (w != self.win && w.isKeyWindow) self.prevKey = w;
+  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Nom de ce temps" message:nil preferredStyle:UIAlertControllerStyleAlert];
+  [a addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = def; }];
+  __weak UIAlertController *wa = a;
+  [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { [self.prevKey makeKeyWindow]; }]];
+  [a addAction:[UIAlertAction actionWithTitle:@"Ajouter" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+    NSString *n = wa.textFields.firstObject.text; if (!n.length) n = def;
+    [E markCue:n]; [self reloadCues]; [self.prevKey makeKeyWindow]; }]];
+  [self.win makeKeyWindow];
+  [self.win.rootViewController presentViewController:a animated:YES completion:nil];
+}
+- (void)chooseVideo {
+  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Vidéo" message:nil preferredStyle:UIAlertControllerStyleAlert];
+  for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:PC_DIR error:nil]) {
+    if (![@[@"mp4", @"mov", @"m4v"] containsObject:f.pathExtension.lowercaseString]) continue;
+    [a addAction:[UIAlertAction actionWithTitle:f style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+      [[PCEngine shared] load:f]; [self.vidBtn setTitle:f forState:UIControlStateNormal]; }]];
+  }
+  [a addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+  [self.win.rootViewController presentViewController:a animated:YES completion:nil];
+}
+- (void)addPhotos {
+  PHPickerConfiguration *c = [[PHPickerConfiguration alloc] init];
+  c.filter = [PHPickerFilter videosFilter]; c.selectionLimit = 0;
+  PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:c];
+  pk.delegate = self;
+  [self.win.rootViewController presentViewController:pk animated:YES completion:nil];
+}
+- (void)addFiles {
+  UIDocumentPickerViewController *d = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeMovie] asCopy:YES];
+  d.delegate = self; d.allowsMultipleSelection = YES;
+  [self.win.rootViewController presentViewController:d animated:YES completion:nil];
+}
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+  [picker dismissViewControllerAnimated:YES completion:nil];
+  for (PHPickerResult *r in results) {
+    [r.itemProvider loadFileRepresentationForTypeIdentifier:@"public.movie" completionHandler:^(NSURL *url, NSError *err) {
+      if (url) [self importURL:url];
+    }];
+  }
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+  for (NSURL *u in urls) [self importURL:u];
+}
+- (void)importURL:(NSURL *)url {
+  NSString *name = [NSString stringWithFormat:@"%ld_%@", (long)[NSDate date].timeIntervalSince1970, url.lastPathComponent];
+  NSString *dst = [PC_DIR stringByAppendingPathComponent:name];
+  [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+  if ([[NSFileManager defaultManager] copyItemAtURL:url toURL:[NSURL fileURLWithPath:dst] error:nil]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [[PCEngine shared] load:name];
+      [self.vidBtn setTitle:name forState:UIControlStateNormal];
+      [self reloadCues];
+    });
+  }
+}
+@end
+
 static NSMutableSet *patched;
 static void PCPatch(Class cls) {
   SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
@@ -294,14 +633,14 @@ static void PCPatch(Class cls) {
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)d queue:(dispatch_queue_t)q {
-  if (d) { PCPatch([d class]); [[PCEngine shared] startServer]; }
+  if (d) { PCPatch([d class]); dispatch_async(dispatch_get_main_queue(), ^{ [[PCUI shared] install]; }); }
   %orig;
 }
 %end
 
 %hook AVCaptureAudioDataOutput
 - (void)setSampleBufferDelegate:(id)d queue:(dispatch_queue_t)q {
-  if (d) { PCPatch([d class]); [[PCEngine shared] startServer]; }
+  if (d) { PCPatch([d class]); }
   %orig;
 }
 %end
