@@ -59,7 +59,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
 - (instancetype)init {
   if ((self = [super init])) {
     _ci = [CIContext contextWithOptions:nil];
-    _ring = calloc(RING_N, sizeof(float)); _lock = OS_UNFAIR_LOCK_INIT; _audioOn = YES;
+    _ring = (float *)calloc(RING_N, sizeof(float)); _lock = OS_UNFAIR_LOCK_INIT; _audioOn = YES;
     NSData *d = [NSData dataWithContentsOfFile:[PC_DIR stringByAppendingPathComponent:@"cues.json"]];
     id j = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
     _cues = [j isKindOfClass:NSMutableDictionary.class] ? j : [NSMutableDictionary new];
@@ -235,9 +235,9 @@ r();setInterval(r,2000)
     double t = CMTimeGetSeconds(self.player.currentTime) + [q[@"d"] doubleValue];
     [self.player seekToTime:CMTimeMakeWithSeconds(MAX(t, 0), 600)]; [self flush];
   } else if ([p isEqualToString:@"/cue"] && self.current) {
-    NSNumber *t = self.cues[self.current][q[@"n"]];
+    NSNumber *t = ((NSDictionary *)self.cues[self.current])[q[@"n"]];
     if (t) { [self.player seekToTime:CMTimeMakeWithSeconds(t.doubleValue, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero]; [self flush]; [self.player play]; }
-  } else if ([p isEqualToString:@"/mark"] && self.current && q[@"n"].length) {
+  } else if ([p isEqualToString:@"/mark"] && self.current && [q[@"n"] length]) {
     NSMutableDictionary *m = self.cues[self.current] ?: [NSMutableDictionary new];
     double t = q[@"t"] ? [q[@"t"] doubleValue] : CMTimeGetSeconds(self.player.currentTime);
     m[q[@"n"]] = @(t); self.cues[self.current] = m; [self saveCues];
@@ -247,8 +247,10 @@ r();setInterval(r,2000)
   NSMutableArray *vids = [NSMutableArray new];
   for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:PC_DIR error:nil])
     if ([@[@"mp4", @"mov", @"m4v"] containsObject:f.pathExtension.lowercaseString]) [vids addObject:f];
+  double ct = CMTimeGetSeconds(self.player.currentTime);
+  if (isnan(ct) || isinf(ct)) ct = 0;
   NSDictionary *s = @{@"enabled": @(self.enabled), @"audio": @(self.audioOn), @"current": self.current ?: [NSNull null], @"videos": vids,
-    @"cues": self.cues[self.current ?: @""] ?: @{}, @"time": @(CMTimeGetSeconds(self.player.currentTime) ?: 0)};
+    @"cues": self.cues[self.current ?: @""] ?: @{}, @"time": @(ct)};
   return [NSJSONSerialization dataWithJSONObject:s options:0 error:nil];
 }
 - (void)startServer {
