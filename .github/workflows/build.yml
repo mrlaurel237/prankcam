@@ -7,8 +7,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Randomblock1/theos-action@v1
-      - run: make package THEOS_PACKAGE_SCHEME=rootless
+      - name: Install tools
+        run: brew install ldid dpkg make
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+      - name: Build
+        run: gmake package THEOS_PACKAGE_SCHEME=rootless
       - uses: actions/upload-artifact@v4
         with:
           name: PrankCam-deb
