@@ -247,10 +247,10 @@ r();setInterval(r,2000)
   NSMutableArray *vids = [NSMutableArray new];
   for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:PC_DIR error:nil])
     if ([@[@"mp4", @"mov", @"m4v"] containsObject:f.pathExtension.lowercaseString]) [vids addObject:f];
-  double ct = CMTimeGetSeconds(self.player.currentTime);
-  if (isnan(ct) || isinf(ct)) ct = 0;
+  double curT = CMTimeGetSeconds(self.player.currentTime);
+  if (curT != curT || curT > 1e12 || curT < -1e12) curT = 0;
   NSDictionary *s = @{@"enabled": @(self.enabled), @"audio": @(self.audioOn), @"current": self.current ?: [NSNull null], @"videos": vids,
-    @"cues": self.cues[self.current ?: @""] ?: @{}, @"time": @(ct)};
+    @"cues": self.cues[self.current ?: @""] ?: @{}, @"time": @(curT)};
   return [NSJSONSerialization dataWithJSONObject:s options:0 error:nil];
 }
 - (void)startServer {
