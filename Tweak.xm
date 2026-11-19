@@ -519,10 +519,20 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   CIFilter *sh = [CIFilter filterWithName:@"CISharpenLuminance"];   // legere accentuation : compense le flou apres reduction
   [sh setValue:img forKey:kCIInputImageKey]; [sh setValue:@0.4 forKey:kCIInputSharpnessKey];
   img = sh.outputImage ?: img;
+  // image envoyee au MEME format que la vraie camera (420f / 420v / BGRA) avec les memes infos de couleur :
+  // certaines apps (appels WhatsApp) rejettent une image d'un autre format et affichent la photo de profil.
+  OSType fmt = CVPixelBufferGetPixelFormatType(orig);
+  if (fmt != kCVPixelFormatType_32BGRA && fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+      fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) fmt = kCVPixelFormatType_32BGRA;
   CVPixelBufferRef dst = NULL;
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-  CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
+  CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
+  if (!dst && fmt != kCVPixelFormatType_32BGRA) {
+    fmt = kCVPixelFormatType_32BGRA;
+    CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
+  }
   if (!dst) return NULL;
+  CVBufferPropagateAttachments(orig, dst);        // memes reperes couleur que la camera
   // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
   // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB.
   [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
