@@ -410,19 +410,10 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSString *p = [PC_DIR stringByAppendingPathComponent:name];
   if (![[NSFileManager defaultManager] fileExistsAtPath:p]) return NO;
   AVPlayerItem *it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:p]];
-  // meme format qu'en 1.3 ; les videos tres lourdes (4K...) sont reduites a 1280 px max par le lecteur :
-  // une image trop grosse a traiter fait sauter des images et l'appel peut croire que la camera est coupee.
   AVAssetTrack *vt = [[it.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-  NSMutableDictionary *pa = [@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                               (id)kCVPixelBufferIOSurfacePropertiesKey: @{}} mutableCopy];
-  CGSize ns = vt ? vt.naturalSize : CGSizeZero;
-  CGFloat big = MAX(ns.width, ns.height);
-  if (big > 1280) {
-    CGFloat k = 1280 / big;
-    pa[(id)kCVPixelBufferWidthKey] = @(((int)lround(ns.width * k)) & ~1);
-    pa[(id)kCVPixelBufferHeightKey] = @(((int)lround(ns.height * k)) & ~1);
-  }
-  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pa];
+  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
+              @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
   [it addOutput:self.out];
   _srcOrient = vt ? PCOrient(vt.preferredTransform) : kCGImagePropertyOrientationUp;
   AVAssetTrack *at = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
@@ -531,10 +522,18 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   CIFilter *sh = [CIFilter filterWithName:@"CISharpenLuminance"];   // legere accentuation : compense le flou apres reduction
   [sh setValue:img forKey:kCIInputImageKey]; [sh setValue:@0.4 forKey:kCIInputSharpnessKey];
   img = sh.outputImage ?: img;
+  // L'image envoyee doit avoir EXACTEMENT le format de la vraie camera (en appel : YUV 420 bi-planaire).
+  // Sinon elle s'affiche chez moi mais l'encodeur de l'appel la rejette et l'autre ne voit que la photo de profil.
+  OSType fmt = CVPixelBufferGetPixelFormatType(orig);
   CVPixelBufferRef dst = NULL;
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-  CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
+  CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
+  if (!dst) {                                      // format exotique : BGRA comme avant
+    fmt = kCVPixelFormatType_32BGRA;
+    CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
+  }
   if (!dst) return NULL;
+  CVBufferPropagateAttachments(orig, dst);        // memes infos couleur / matrice YUV que la camera
   // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
   // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB.
   [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
