@@ -85,6 +85,8 @@ static CIImage *PCSaturate(CIImage *img, float sat) {
   return cc.outputImage ?: img;
 }
 static void PCPreviewStart(void);
+static void PCCaptureHooksOn(void);
+static BOOL PCCaptureOn(void);
 static float PCFloat(id v, float def) { return [v isKindOfClass:NSNumber.class] ? [v floatValue] : def; }
 // gains audio lus depuis les threads audio (simples floats : pas de verrou necessaire)
 static volatile float gMonGain  = 0.8f;   // volume d'ecoute de la video sur l'iPhone (0 = muet)
@@ -521,20 +523,10 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   CIFilter *sh = [CIFilter filterWithName:@"CISharpenLuminance"];   // legere accentuation : compense le flou apres reduction
   [sh setValue:img forKey:kCIInputImageKey]; [sh setValue:@0.4 forKey:kCIInputSharpnessKey];
   img = sh.outputImage ?: img;
-  // image envoyee au MEME format que la vraie camera (420f / 420v / BGRA) avec les memes infos de couleur :
-  // certaines apps (appels WhatsApp) rejettent une image d'un autre format et affichent la photo de profil.
-  OSType fmt = CVPixelBufferGetPixelFormatType(orig);
-  if (fmt != kCVPixelFormatType_32BGRA && fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
-      fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) fmt = kCVPixelFormatType_32BGRA;
   CVPixelBufferRef dst = NULL;
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-  CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
-  if (!dst && fmt != kCVPixelFormatType_32BGRA) {
-    fmt = kCVPixelFormatType_32BGRA;
-    CVPixelBufferCreate(NULL, W, H, fmt, (__bridge CFDictionaryRef)at, &dst);
-  }
+  CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
   if (!dst) return NULL;
-  CVBufferPropagateAttachments(orig, dst);        // memes reperes couleur que la camera
   // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
   // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB.
   [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
@@ -955,8 +947,10 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   [st addArrangedSubview:PCLabel(@"Image", 15, YES)];
   [st addArrangedSubview:[self sliderRow:@"Saturation" min:0 max:1.5 value:E.saturation action:@selector(slSat:)]];
   [st addArrangedSubview:PCBtn(@"Couleurs d'origine (100 %)", self, @selector(resetSat))];
-  [st addArrangedSubview:PCRow(@"Voir aussi la vidéo sur mon écran (aperçu caméra, appel vidéo)", [self sw:PCBool(E.prefs[@"preview"], YES) action:@selector(swPreview:)])];
-  [st addArrangedSubview:[self hint:@"Photos et vidéos de la caméra (WhatsApp...) : remplacées par la vidéo quand la caméra prank est active."]];
+  [st addArrangedSubview:PCLabel(@"Options avancées (désactivées par défaut)", 15, YES)];
+  [st addArrangedSubview:PCRow(@"Voir aussi la vidéo sur mon écran (aperçu caméra, appel vidéo)", [self sw:PCBool(E.prefs[@"preview"], NO) action:@selector(swPreview:)])];
+  [st addArrangedSubview:PCRow(@"Remplacer aussi les photos et vidéos de l'appareil photo", [self sw:PCBool(E.prefs[@"capture"], NO) action:@selector(swCapture:)])];
+  [st addArrangedSubview:[self hint:@"Si un appel vidéo n'affiche plus que ta photo de profil : coupe ces deux options puis relance l'app."]];
   [st addArrangedSubview:PCLabel(@"Lecture", 15, YES)];
   [st addArrangedSubview:PCRow(@"Repartir à 0 à chaque activation", [self sw:E.zeroOnActivate action:@selector(swZero:)])];
   [st addArrangedSubview:PCRow(@"Boucle (sinon reste sur la dernière image)", [self sw:E.loop action:@selector(swLoop:)])];
@@ -1058,6 +1052,10 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
 - (void)swMonitor:(UISwitch *)s {
   PCEngine *E = [PCEngine shared]; E.monitorOn = s.on; [E savePrefs];
   if (s.on && E.player.rate > 0) [E go];          // bascule sur le haut-parleur si besoin
+}
+- (void)swCapture:(UISwitch *)s {
+  PCEngine *E = [PCEngine shared]; E.prefs[@"capture"] = @(s.on); [E savePrefs];
+  if (s.on) PCCaptureHooksOn();
 }
 - (void)swPreview:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.prefs[@"preview"] = @(s.on); [E savePrefs]; }
 - (void)swMix:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.mixMic = s.on; [E savePrefs]; }
@@ -1236,7 +1234,7 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
 }
 - (void)tick {
   PCEngine *E = [PCEngine shared];
-  BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], YES);
+  BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], NO);
   NSArray *ls = self.layers.allObjects;
   if (!want) {                                     // OFF : on retire tout et on s'arrete (aucun effet sur l'app)
     for (CALayer *l in ls) {
@@ -1544,10 +1542,11 @@ static BOOL PCTargetApp(void) {
 
 
 
-// ---------- photos ----------
+// ---------- photos / videos de l'appareil photo : installes seulement si l'option est activee ----------
+%group PCCapture
 %hook AVCapturePhotoOutput
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)st delegate:(id)d {
-  PCShot *sh = PCTakeShot();
+  PCShot *sh = PCCaptureOn() ? PCTakeShot() : nil;
   @synchronized (gShots) {
     if (gShots.count > 16) [gShots removeAllObjects];
     if (sh) gShots[@(st.uniqueID)] = sh; else [gShots removeObjectForKey:@(st.uniqueID)];
@@ -1584,7 +1583,7 @@ static BOOL PCTargetApp(void) {
 
 %hook AVCaptureStillImageOutput
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)c completionHandler:(id)h {
-  gLastShot = PCTakeShot();
+  gLastShot = PCCaptureOn() ? PCTakeShot() : nil;
   %orig;
 }
 + (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)sb {
@@ -1596,13 +1595,23 @@ static BOOL PCTargetApp(void) {
 // ---------- videos enregistrees ----------
 %hook AVCaptureMovieFileOutput
 - (void)startRecordingToOutputFileURL:(NSURL *)url recordingDelegate:(id)d {
-  NSDictionary *cfg = d ? [[PCEngine shared] recordConfig] : nil;
+  NSDictionary *cfg = (d && PCCaptureOn()) ? [[PCEngine shared] recordConfig] : nil;
   if (!cfg) { %orig; return; }
   PCRecProxy *p = [PCRecProxy new]; p.real = d; p.cfg = cfg;
   @synchronized (gRecProxies) { [gRecProxies addObject:p]; }
   %orig(url, p);
 }
 %end
+
+%end
+
+static BOOL PCCaptureOn(void) { return PCBool([PCEngine shared].prefs[@"capture"], NO); }
+static void PCCaptureHooksOn(void) {
+  static BOOL done = NO;
+  if (done) return;
+  done = YES;
+  %init(PCCapture);
+}
 
 // Apps qui lisent le micro via une AudioUnit (appels WhatsApp / Messenger, WebRTC...) : on remplace les echantillons du micro
 %hookf(OSStatus, AudioUnitRender, AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
@@ -1613,7 +1622,9 @@ static BOOL PCTargetApp(void) {
 
 %ctor {
   patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new];
-  if (PCTargetApp())                              // icone dispo aussi dans l'appareil photo (pas seulement en appel)
+  if (PCTargetApp() && PCCaptureOn()) {           // option photos/videos : hooks + icone dans l'appareil photo
+    PCCaptureHooksOn();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
       queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) { [[PCUI shared] install]; }];
+  }
 }
