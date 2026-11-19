@@ -17,5 +17,5 @@ jobs:
         run: gmake package THEOS_PACKAGE_SCHEME=rootless
       - uses: actions/upload-artifact@v4
         with:
-          name: PrankCam-deb
+          name: PrankCamPro-deb
           path: packages/*.deb

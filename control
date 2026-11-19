@@ -1,9 +1,11 @@
-Package: com.chuck.prankcam
-Name: PrankCam
-Version: 0.1.0
+Package: com.chuck.prankcampro
+Name: PrankCam Pro
+Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: Prank cam avec reperes nommes, son, telecommande web et bandeau LIVE PRANK
+Description: Prank cam : icone flottante (1 tap = ON/OFF), mini-telecommande avec bouton 0 (retour au debut), reperes nommes, son video, telecommande web. Bandeau LIVE PRANK toujours visible.
 Maintainer: Chuck
 Author: Chuck
 Section: Tweaks
-Depends: mobilesubstrate | ellekit
+Depends: firmware (>= 15.0), mobilesubstrate | ellekit
+Conflicts: com.chuck.prankcam
+Replaces: com.chuck.prankcam
