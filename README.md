@@ -17,6 +17,10 @@ Tweak rootless (iOS 15+, Dopamine / palera1n, ElleKit ou Substrate) qui remplace
   - *Envoyer le son de la vidéo* (à la place du micro) + *Volume de la vidéo envoyée* (0 à 200 %).
   - *Ajouter ma voix* : envoie la vidéo + ton micro mélangés proprement (de préférence avec des écouteurs).
 - **Image** : les couleurs sont maintenant rendues en sRGB / BT.709 (avant, l'image sortait sans gestion des couleurs : trop contrastée et trop saturée ; les vidéos HDR de l'iPhone sont aussi converties correctement). Curseur *Saturation* + bouton *Couleurs d'origine*.
+- **Caméra des apps (WhatsApp...)** quand la caméra prank est active :
+  - *Aperçu à l'écran* : la vidéo remplace aussi ce que tu vois (appareil photo, petite fenêtre « moi » pendant un appel vidéo). Réglage *Voir aussi la vidéo sur mon écran* (activé par défaut).
+  - *Photos* : la photo prise est l'image de la vidéo à cet instant (avec le bandeau LIVE PRANK).
+  - *Vidéos* enregistrées avec l'appareil photo : le fichier est refait avec la vidéo prank (même durée, son selon les réglages). L'envoi prend quelques secondes de plus.
 - **Télécommande web** (désactivée par défaut) : depuis un autre téléphone sur le même Wi-Fi, ouvre l'adresse affichée dans les réglages (`http://IP-de-l-iPhone:8765`).
 
 Les vidéos, les repères et les réglages sont gardés dans le dossier `PrankCam` de l'app, donc les vidéos déjà importées avec PrankCam restent disponibles.

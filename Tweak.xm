@@ -5,7 +5,9 @@
 //   - glisser                = deplacer l'icone (position memorisee)
 // Mini-telecommande flottante : bouton "0" = retour au debut de la video (appui long = debut en pause), play/pause.
 // Le bandeau "LIVE PRANK" est dessine sur chaque image et ne peut pas etre desactive.
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -46,6 +48,42 @@ static BOOL PCIsIOUnit(AudioUnit u) {   // unite d'entree micro (RemoteIO / Voic
          (d.componentSubType == kAudioUnitSubType_RemoteIO || d.componentSubType == kAudioUnitSubType_VoiceProcessingIO);
 }
 static BOOL PCBool(id v, BOOL def) { return [v isKindOfClass:NSNumber.class] ? [v boolValue] : def; }
+static CGImagePropertyOrientation PCOrient(CGAffineTransform t) {   // rotation d'une piste video -> orientation
+  if (t.a == 0 && t.b == 1 && t.c == -1 && t.d == 0) return kCGImagePropertyOrientationRight;
+  if (t.a == 0 && t.b == -1 && t.c == 1 && t.d == 0) return kCGImagePropertyOrientationLeft;
+  if (t.a == -1 && t.b == 0 && t.c == 0 && t.d == -1) return kCGImagePropertyOrientationDown;
+  return kCGImagePropertyOrientationUp;
+}
+static CIImage *PCMakeWM(CGSize s, BOOL top) {   // bandeau LIVE PRANK (toujours present)
+  UIGraphicsBeginImageContextWithOptions(s, NO, 1);
+  CGFloat fh = MAX(s.height * 0.028, 12);   // petit : ~3% de la hauteur
+  NSShadow *sh = [NSShadow new]; sh.shadowColor = [UIColor colorWithWhite:0 alpha:0.6];
+  sh.shadowOffset = CGSizeMake(0, 1); sh.shadowBlurRadius = 2;
+  NSDictionary *a = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:fh],
+                      NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.55],
+                      NSShadowAttributeName: sh};
+  CGSize ts = [PC_WM sizeWithAttributes:a];
+  [PC_WM drawAtPoint:CGPointMake((s.width - ts.width) / 2, top ? fh * 0.6 : s.height - ts.height - fh * 0.6) withAttributes:a];
+  UIImage *im = UIGraphicsGetImageFromCurrentImageContext();
+  UIGraphicsEndImageContext();
+  return [[CIImage alloc] initWithImage:im];
+}
+static CGColorSpaceRef PCSRGB(void) {
+  static CGColorSpaceRef c; static dispatch_once_t o;
+  dispatch_once(&o, ^{ c = CGColorSpaceCreateWithName(kCGColorSpaceSRGB); });
+  return c;
+}
+static void PCTag709(CVPixelBufferRef b) {
+  CVBufferSetAttachment(b, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(b, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(b, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+}
+static CIImage *PCSaturate(CIImage *img, float sat) {
+  if (fabsf(sat - 1.f) <= 0.01f) return img;
+  CIFilter *cc = [CIFilter filterWithName:@"CIColorControls"];
+  [cc setValue:img forKey:kCIInputImageKey]; [cc setValue:@(sat) forKey:kCIInputSaturationKey];
+  return cc.outputImage ?: img;
+}
 static float PCFloat(id v, float def) { return [v isKindOfClass:NSNumber.class] ? [v floatValue] : def; }
 // gains audio lus depuis les threads audio (simples floats : pas de verrou necessaire)
 static volatile float gMonGain  = 0.8f;   // volume d'ecoute de la video sur l'iPhone (0 = muet)
@@ -71,7 +109,8 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 }
 
 @interface PCEngine : NSObject {
-  CVPixelBufferRef _last; CIImage *_wm; CGSize _wmSize; BOOL _wmTop; BOOL _serverUp;
+  CVPixelBufferRef _last; NSMutableDictionary *_wmCache; os_unfair_lock _wmLock, _frameLock; BOOL _serverUp;
+  CGImagePropertyOrientation _srcOrient;
   float *_ring; size_t _wp; double _rp; os_unfair_lock _lock;
   double _tapRate; UInt32 _tapCh; BOOL _tapNonInter;
   id _endObs;
@@ -86,6 +125,7 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 @property (nonatomic) float sendVol;              // volume de la video envoyee 0..2
 @property (nonatomic) BOOL mixMic;                // envoyer video + ma voix
 @property (nonatomic) float saturation;           // 1 = couleurs d'origine de la video
+@property (atomic) NSUInteger frameGen;           // +1 a chaque nouvelle image de la video
 @property (nonatomic, strong) NSMutableDictionary *prefs; // reglages persistants (settings.json)
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerItemVideoOutput *out;
@@ -111,6 +151,10 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 - (void)deleteCue:(NSString *)n;
 - (void)deleteVideo:(NSString *)f;
 - (CMSampleBufferRef)replace:(CMSampleBufferRef)sb CF_RETURNS_RETAINED;
+- (CIImage *)grabFrame;
+- (CIImage *)styled:(CIImage *)img upright:(BOOL)up;
+- (CVPixelBufferRef)renderImage:(CIImage *)img maxSide:(CGFloat)m CF_RETURNS_RETAINED;
+- (NSDictionary *)recordConfig;
 - (void)replaceAudio:(CMSampleBufferRef)sb;
 - (void)replaceAudioUnit:(AudioUnit)u abl:(AudioBufferList *)io frames:(UInt32)fr;
 - (void)pull:(float *)out frames:(UInt32)fr ratio:(double)ratio;
@@ -145,6 +189,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if ((self = [super init])) {
     _ci = [CIContext contextWithOptions:@{kCIContextHighQualityDownsample: @YES}];
     _ring = (float *)calloc(RING_N, sizeof(float)); _lock = OS_UNFAIR_LOCK_INIT;
+    _wmLock = OS_UNFAIR_LOCK_INIT; _frameLock = OS_UNFAIR_LOCK_INIT; _wmCache = [NSMutableDictionary new];
     NSData *d = [NSData dataWithContentsOfFile:[PC_DIR stringByAppendingPathComponent:@"cues.json"]];
     id j = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
     _cues = [j isKindOfClass:NSMutableDictionary.class] ? j : [NSMutableDictionary new];
@@ -371,6 +416,8 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
                                              AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                                              AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2}}];
   [it addOutput:self.out];
+  AVAssetTrack *vt = [[it.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+  _srcOrient = vt ? PCOrient(vt.preferredTransform) : kCGImagePropertyOrientationUp;
   AVAssetTrack *at = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
   if (at) {
     AVMutableAudioMixInputParameters *ip = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:at];
@@ -397,22 +444,59 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (self.enabled) [self go]; else [self.player pause];   // inactif : la video attend au debut
   return YES;
 }
-- (CIImage *)wmForSize:(CGSize)s {
+- (CIImage *)wmForSize:(CGSize)s {          // cache par taille (camera, apercu, photo...) ; appele depuis plusieurs threads
   BOOL top = PCBool(_prefs[@"wm_top"], NO);
-  if (_wm && CGSizeEqualToSize(_wmSize, s) && top == _wmTop) return _wm;
-  UIGraphicsBeginImageContextWithOptions(s, NO, 1);
-  CGFloat fh = MAX(s.height * 0.028, 12);   // petit : ~3% de la hauteur
-  NSShadow *sh = [NSShadow new]; sh.shadowColor = [UIColor colorWithWhite:0 alpha:0.6];
-  sh.shadowOffset = CGSizeMake(0, 1); sh.shadowBlurRadius = 2;
-  NSDictionary *a = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:fh],
-                      NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.55],
-                      NSShadowAttributeName: sh};
-  CGSize ts = [PC_WM sizeWithAttributes:a];
-  [PC_WM drawAtPoint:CGPointMake((s.width - ts.width) / 2, top ? fh * 0.6 : s.height - ts.height - fh * 0.6) withAttributes:a];
-  UIImage *im = UIGraphicsGetImageFromCurrentImageContext();
-  UIGraphicsEndImageContext();
-  _wm = [[CIImage alloc] initWithImage:im]; _wmSize = s; _wmTop = top;
-  return _wm;
+  NSString *k = [NSString stringWithFormat:@"%.0fx%.0f-%d", s.width, s.height, top];
+  os_unfair_lock_lock(&_wmLock);
+  CIImage *w = _wmCache[k];
+  os_unfair_lock_unlock(&_wmLock);
+  if (w) return w;
+  w = PCMakeWM(s, top);
+  os_unfair_lock_lock(&_wmLock);
+  if (_wmCache.count > 8) [_wmCache removeAllObjects];
+  _wmCache[k] = w;
+  os_unfair_lock_unlock(&_wmLock);
+  return w;
+}
+- (CIImage *)grabFrame {                     // derniere image de la video (partagee : camera, apercu, photos)
+  os_unfair_lock_lock(&_frameLock);
+  AVPlayerItemVideoOutput *o = self.out;
+  if (o) {
+    CMTime t = [o itemTimeForHostTime:CACurrentMediaTime()];
+    CVPixelBufferRef src = [o copyPixelBufferForItemTime:t itemTimeForDisplay:NULL];
+    if (src) { if (_last) CVPixelBufferRelease(_last); _last = src; self.frameGen++; }
+  }
+  CIImage *img = _last ? [CIImage imageWithCVPixelBuffer:_last] : nil;
+  os_unfair_lock_unlock(&_frameLock);
+  return img;
+}
+- (CIImage *)styled:(CIImage *)img upright:(BOOL)up {   // saturation + bandeau ; up = remise a l'endroit (apercu, photo)
+  if (!img) return nil;
+  if (up && _srcOrient != kCGImagePropertyOrientationUp) img = [img imageByApplyingCGOrientation:_srcOrient];
+  img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
+  img = PCSaturate(img, self.saturation);
+  return [[self wmForSize:img.extent.size] imageByCompositingOverImage:img];
+}
+- (CVPixelBufferRef)renderImage:(CIImage *)img maxSide:(CGFloat)m {
+  if (!img) return NULL;
+  CGSize sz = img.extent.size;
+  CGFloat k = (m > 0 && MAX(sz.width, sz.height) > m) ? m / MAX(sz.width, sz.height) : 1;
+  if (k < 1) img = [img imageByApplyingTransform:CGAffineTransformMakeScale(k, k)];
+  size_t W = (size_t)lround(sz.width * k), H = (size_t)lround(sz.height * k);
+  if (!W || !H) return NULL;
+  CVPixelBufferRef dst = NULL;
+  NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+  CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
+  if (!dst) return NULL;
+  PCTag709(dst);
+  [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
+  return dst;
+}
+- (NSDictionary *)recordConfig {             // reglages figes au debut d'un enregistrement video
+  if (!self.enabled || !self.current) return nil;
+  double t = CMTimeGetSeconds(self.player.currentTime); if (!(t > 0)) t = 0;
+  return @{@"path": [PC_DIR stringByAppendingPathComponent:self.current], @"start": @(t), @"audio": @(self.audioOn),
+           @"send": @(self.sendVol), @"mix": @(self.mixMic), @"sat": @(self.saturation), @"top": @(PCBool(_prefs[@"wm_top"], NO))};
 }
 - (CMSampleBufferRef)replace:(CMSampleBufferRef)sb {
   if (!self.enabled) return NULL;
@@ -420,19 +504,9 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (!orig) { if (self.audioOn) [self replaceAudio:sb]; return NULL; }
   if (!self.out) return NULL;
   size_t W = CVPixelBufferGetWidth(orig), H = CVPixelBufferGetHeight(orig);
-  CMTime t = [self.out itemTimeForHostTime:CACurrentMediaTime()];
-  CVPixelBufferRef src = [self.out copyPixelBufferForItemTime:t itemTimeForDisplay:NULL];
-  if (src) { if (_last) CVPixelBufferRelease(_last); _last = src; }
-  if (!_last) return NULL;
-  CIImage *img = [CIImage imageWithCVPixelBuffer:_last];
-  float sat = self.saturation;
-  if (fabsf(sat - 1.f) > 0.01f) {                 // reglage saturation (100 % = couleurs d'origine)
-    CIFilter *cc = [CIFilter filterWithName:@"CIColorControls"];
-    [cc setValue:img forKey:kCIInputImageKey]; [cc setValue:@(sat) forKey:kCIInputSaturationKey];
-    img = cc.outputImage ?: img;
-  }
-  // 1) bandeau obligatoire, dans le repere de la video (en bas de l'image)
-  img = [[self wmForSize:img.extent.size] imageByCompositingOverImage:img];
+  // 1) saturation + bandeau obligatoire, dans le repere de la video (en bas de l'image)
+  CIImage *img = [self styled:[self grabFrame] upright:NO];
+  if (!img) return NULL;
   // 2) video portrait dans un buffer camera paysage -> rotation (si c'est de travers, inverse le signe)
   if (img.extent.size.width < img.extent.size.height && W > H) {
     img = [img imageByApplyingTransform:CGAffineTransformMakeRotation(PC_ROT)];
@@ -457,12 +531,8 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (!dst) return NULL;
   // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
   // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB et on etiquette le buffer en BT.709.
-  static CGColorSpaceRef srgb; static dispatch_once_t once;
-  dispatch_once(&once, ^{ srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB); });
-  CVBufferSetAttachment(dst, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-  CVBufferSetAttachment(dst, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-  CVBufferSetAttachment(dst, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-  [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:srgb];
+  PCTag709(dst);
+  [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
   CMVideoFormatDescriptionRef fd = NULL;
   CMVideoFormatDescriptionCreateForImageBuffer(NULL, dst, &fd);
   CMSampleTimingInfo ti; CMSampleBufferGetSampleTimingInfo(sb, 0, &ti);
@@ -880,6 +950,8 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   [st addArrangedSubview:PCLabel(@"Image", 15, YES)];
   [st addArrangedSubview:[self sliderRow:@"Saturation" min:0 max:1.5 value:E.saturation action:@selector(slSat:)]];
   [st addArrangedSubview:PCBtn(@"Couleurs d'origine (100 %)", self, @selector(resetSat))];
+  [st addArrangedSubview:PCRow(@"Voir aussi la vidéo sur mon écran (aperçu caméra, appel vidéo)", [self sw:PCBool(E.prefs[@"preview"], YES) action:@selector(swPreview:)])];
+  [st addArrangedSubview:[self hint:@"Photos et vidéos de la caméra (WhatsApp...) : remplacées par la vidéo quand la caméra prank est active."]];
   [st addArrangedSubview:PCLabel(@"Lecture", 15, YES)];
   [st addArrangedSubview:PCRow(@"Repartir à 0 à chaque activation", [self sw:E.zeroOnActivate action:@selector(swZero:)])];
   [st addArrangedSubview:PCRow(@"Boucle (sinon reste sur la dernière image)", [self sw:E.loop action:@selector(swLoop:)])];
@@ -982,6 +1054,7 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   PCEngine *E = [PCEngine shared]; E.monitorOn = s.on; [E savePrefs];
   if (s.on && E.player.rate > 0) [E go];          // bascule sur le haut-parleur si besoin
 }
+- (void)swPreview:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.prefs[@"preview"] = @(s.on); [E savePrefs]; }
 - (void)swMix:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.mixMic = s.on; [E savePrefs]; }
 static const void *kPCSliderLbl = &kPCSliderLbl;
 static void PCSliderText(UISlider *s) {
@@ -1108,6 +1181,306 @@ static void PCSliderText(UISlider *s) {
 }
 @end
 
+
+// ---------- apercu a l'ecran : la video remplace aussi l'image de AVCaptureVideoPreviewLayer ----------
+// (appareil photo WhatsApp, petite fenetre "moi" pendant un appel video...)
+static const void *kPCOverlay = &kPCOverlay;
+@interface PCPreview : NSObject
+@property (nonatomic, strong) NSHashTable *layers;
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic) NSUInteger lastGen;
+@property (nonatomic) BOOL shown;
++ (instancetype)shared;
+- (void)add:(CALayer *)l;
+@end
+@implementation PCPreview
++ (instancetype)shared {
+  static PCPreview *p; static dispatch_once_t o;
+  dispatch_once(&o, ^{ p = [PCPreview new]; p.layers = [NSHashTable weakObjectsHashTable]; });
+  return p;
+}
+- (void)add:(CALayer *)l {
+  if (!l) return;
+  if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self add:l]; }); return; }
+  [self.layers addObject:l];
+  [[PCUI shared] install];
+  if (!self.link) {
+    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+    self.link.preferredFramesPerSecond = 30;
+    [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+  }
+}
+static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu (effet miroir) ?
+  CGFloat det = 1;
+  for (CALayer *x = l; x; x = x.superlayer) {
+    CGAffineTransform t = CATransform3DGetAffineTransform(x.transform);
+    det *= (t.a * t.d - t.b * t.c);
+  }
+  return det < 0;
+}
+- (void)tick {
+  PCEngine *E = [PCEngine shared];
+  BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], YES);
+  NSArray *ls = self.layers.allObjects;
+  if (!want) {
+    if (self.shown) {
+      for (AVCaptureVideoPreviewLayer *l in ls) {
+        AVSampleBufferDisplayLayer *ov = objc_getAssociatedObject(l, kPCOverlay);
+        if (ov) { ov.hidden = YES; [ov flushAndRemoveImage]; }
+      }
+      self.shown = NO;
+    }
+    return;
+  }
+  BOOL any = NO;
+  for (CALayer *l in ls) if (l.superlayer && !l.hidden) { any = YES; break; }
+  if (!any) return;
+  CIImage *raw = [E grabFrame];
+  if (!raw || (self.shown && E.frameGen == self.lastGen)) return;   // rien de nouveau
+  self.lastGen = E.frameGen;
+  CVPixelBufferRef pb = [E renderImage:[E styled:raw upright:YES] maxSide:1280];
+  if (!pb) return;
+  CMVideoFormatDescriptionRef fd = NULL; CMSampleBufferRef sb = NULL;
+  CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &fd);
+  CMSampleTimingInfo ti = {kCMTimeInvalid, CMClockGetTime(CMClockGetHostTimeClock()), kCMTimeInvalid};
+  if (fd) CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, fd, &ti, &sb);
+  if (fd) CFRelease(fd);
+  CVPixelBufferRelease(pb);
+  if (!sb) return;
+  CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, YES);
+  if (atts && CFArrayGetCount(atts)) CFDictionarySetValue((CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0), kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+  [CATransaction begin]; [CATransaction setDisableActions:YES];
+  for (AVCaptureVideoPreviewLayer *l in ls) {
+    if (!l.superlayer) continue;
+    AVSampleBufferDisplayLayer *ov = objc_getAssociatedObject(l, kPCOverlay);
+    if (!ov) {
+      ov = [AVSampleBufferDisplayLayer new];
+      objc_setAssociatedObject(l, kPCOverlay, ov, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (ov.superlayer != l) [l addSublayer:ov];
+    ov.zPosition = 10000; ov.hidden = NO;
+    ov.frame = l.bounds;
+    ov.videoGravity = [l respondsToSelector:@selector(videoGravity)] ? l.videoGravity : AVLayerVideoGravityResizeAspectFill;
+    ov.affineTransform = PCMirrored(l) ? CGAffineTransformMakeScale(-1, 1) : CGAffineTransformIdentity;   // texte lisible
+    if (ov.status == AVQueuedSampleBufferRenderingStatusFailed) [ov flush];
+    [ov enqueueSampleBuffer:sb];
+  }
+  [CATransaction commit];
+  CFRelease(sb);
+  self.shown = YES;
+}
+@end
+
+// ---------- photos : AVCapturePhotoOutput / AVCaptureStillImageOutput ----------
+@interface PCShot : NSObject {
+  CVPixelBufferRef _pb; CGImageRef _cg;
+}
+@property (nonatomic, strong) CIImage *img;
+@property (nonatomic, strong) NSData *jpegData;
+- (NSData *)jpeg;
+- (CVPixelBufferRef)pixelBuffer;
+- (CGImageRef)cgImage;
+@end
+@implementation PCShot
+- (NSData *)jpeg {
+  @synchronized (self) {
+    if (!_jpegData) _jpegData = [[PCEngine shared].ci JPEGRepresentationOfImage:self.img colorSpace:PCSRGB()
+                                   options:@{(id)kCGImageDestinationLossyCompressionQuality: @0.92}];
+    return _jpegData;
+  }
+}
+- (CVPixelBufferRef)pixelBuffer {
+  @synchronized (self) { if (!_pb) _pb = [[PCEngine shared] renderImage:self.img maxSide:0]; return _pb; }
+}
+- (CGImageRef)cgImage {
+  @synchronized (self) {
+    if (!_cg) _cg = [[PCEngine shared].ci createCGImage:self.img fromRect:self.img.extent format:kCIFormatRGBA8 colorSpace:PCSRGB()];
+    return _cg;
+  }
+}
+- (void)dealloc { if (_pb) CVPixelBufferRelease(_pb); if (_cg) CGImageRelease(_cg); }
+@end
+
+static NSMutableDictionary *gShots;   // uniqueID des reglages photo -> image prank
+static PCShot *gLastShot;
+static PCShot *PCTakeShot(void) {
+  PCEngine *E = [PCEngine shared];
+  if (!E.enabled) return nil;
+  CIImage *img = [E styled:[E grabFrame] upright:YES];
+  if (!img) return nil;
+  PCShot *s = [PCShot new]; s.img = img;
+  return s;
+}
+static PCShot *PCShotFor(AVCapturePhoto *p) {
+  @synchronized (gShots) { return gShots[@(p.resolvedSettings.uniqueID)]; }
+}
+
+// ---------- videos : AVCaptureMovieFileOutput -> le fichier est refait avec la video prank ----------
+static void PCRenderMovie(NSURL *rec, NSDictionary *cfg, void (^done)(void)) {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
+    BOOL ok = NO;
+    NSString *ext = rec.pathExtension.length ? rec.pathExtension : @"mov";
+    NSURL *tmp = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
+                  [NSString stringWithFormat:@"pc_%@.%@", [NSUUID UUID].UUIDString, ext]]];
+    do {
+      AVURLAsset *ra = [AVURLAsset URLAssetWithURL:rec options:nil];
+      AVURLAsset *sa = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:cfg[@"path"]] options:nil];
+      AVAssetTrack *sv = [sa tracksWithMediaType:AVMediaTypeVideo].firstObject;
+      if (!sv) break;
+      double rdur = CMTimeGetSeconds(ra.duration), sdur = CMTimeGetSeconds(sa.duration);
+      if (!(rdur > 0) || !(sdur > 0)) break;
+      double len = MIN(rdur, sdur);
+      double st = MAX(0, MIN([cfg[@"start"] doubleValue], sdur - len));
+      CMTime clen = CMTimeMakeWithSeconds(len, 600);
+      AVMutableComposition *c = [AVMutableComposition composition];
+      AVMutableCompositionTrack *cv = [c addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+      if (![cv insertTimeRange:CMTimeRangeMake(CMTimeMakeWithSeconds(st, 600), clen) ofTrack:sv atTime:kCMTimeZero error:nil]) break;
+      NSMutableArray *params = [NSMutableArray new];
+      BOOL audioOn = [cfg[@"audio"] boolValue], mix = [cfg[@"mix"] boolValue];
+      float send = [cfg[@"send"] floatValue];
+      AVAssetTrack *sat = [sa tracksWithMediaType:AVMediaTypeAudio].firstObject, *rat = [ra tracksWithMediaType:AVMediaTypeAudio].firstObject;
+      if (audioOn && sat && send > 0.001f) {          // son de la video
+        AVMutableCompositionTrack *ca = [c addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+        if ([ca insertTimeRange:CMTimeRangeMake(CMTimeMakeWithSeconds(st, 600), clen) ofTrack:sat atTime:kCMTimeZero error:nil]) {
+          AVMutableAudioMixInputParameters *p = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:ca];
+          [p setVolume:MIN(send, 1.f) atTime:kCMTimeZero]; [params addObject:p];
+        }
+      }
+      if ((!audioOn || mix) && rat) {                 // mon micro (seul, ou melange a la video)
+        AVMutableCompositionTrack *cm = [c addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+        if ([cm insertTimeRange:CMTimeRangeMake(kCMTimeZero, clen) ofTrack:rat atTime:kCMTimeZero error:nil]) {
+          AVMutableAudioMixInputParameters *p = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:cm];
+          [p setVolume:1 atTime:kCMTimeZero]; [params addObject:p];
+        }
+      }
+      NSError *err = nil;
+      AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:c error:&err];
+      if (!rd) break;
+      rd.timeRange = CMTimeRangeMake(kCMTimeZero, clen);
+      AVAssetReaderTrackOutput *vo = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:cv outputSettings:
+        @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
+      vo.alwaysCopiesSampleData = NO;
+      if (![rd canAddOutput:vo]) break;
+      [rd addOutput:vo];
+      AVAssetReaderAudioMixOutput *ao = nil;
+      NSArray *atr = [c tracksWithMediaType:AVMediaTypeAudio];
+      NSDictionary *pcm = @{AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @44100, AVNumberOfChannelsKey: @2,
+                            AVLinearPCMBitDepthKey: @16, AVLinearPCMIsFloatKey: @NO, AVLinearPCMIsBigEndianKey: @NO,
+                            AVLinearPCMIsNonInterleaved: @NO};
+      if (atr.count) {
+        ao = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:atr audioSettings:pcm];
+        AVMutableAudioMix *am = [AVMutableAudioMix audioMix]; am.inputParameters = params; ao.audioMix = am;
+        if ([rd canAddOutput:ao]) [rd addOutput:ao]; else ao = nil;
+      }
+      CGImagePropertyOrientation o = PCOrient(sv.preferredTransform);
+      CGSize ns = sv.naturalSize;
+      BOOL swap = o == kCGImagePropertyOrientationLeft || o == kCGImagePropertyOrientationRight;
+      size_t W = ((size_t)lround(swap ? ns.height : ns.width)) & ~(size_t)1, H = ((size_t)lround(swap ? ns.width : ns.height)) & ~(size_t)1;
+      if (W < 16 || H < 16) break;
+      AVAssetWriter *w = [AVAssetWriter assetWriterWithURL:tmp fileType:[ext.lowercaseString isEqualToString:@"mp4"] ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie error:&err];
+      if (!w) break;
+      AVAssetWriterInput *wv = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:
+        @{AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @(W), AVVideoHeightKey: @(H),
+          AVVideoColorPropertiesKey: @{AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                       AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                       AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2}}];
+      wv.expectsMediaDataInRealTime = NO;
+      AVAssetWriterInputPixelBufferAdaptor *ad = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:wv
+        sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferWidthKey: @(W),
+                                      (id)kCVPixelBufferHeightKey: @(H), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
+      if (![w canAddInput:wv]) break;
+      [w addInput:wv];
+      AVAssetWriterInput *wa = nil;
+      if (ao) {
+        wa = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:
+          @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @44100, AVNumberOfChannelsKey: @2, AVEncoderBitRateKey: @128000}];
+        wa.expectsMediaDataInRealTime = NO;
+        if ([w canAddInput:wa]) [w addInput:wa]; else wa = nil;
+      }
+      if (![rd startReading] || ![w startWriting]) { [rd cancelReading]; [w cancelWriting]; break; }
+      [w startSessionAtSourceTime:kCMTimeZero];
+      CIContext *ctx = [CIContext contextWithOptions:nil];
+      CIImage *wm = PCMakeWM(CGSizeMake(W, H), [cfg[@"top"] boolValue]);
+      float sat2 = [cfg[@"sat"] floatValue];
+      dispatch_group_t g = dispatch_group_create();
+      dispatch_queue_t qv = dispatch_queue_create("pc.export.v", DISPATCH_QUEUE_SERIAL);
+      dispatch_queue_t qa = dispatch_queue_create("pc.export.a", DISPATCH_QUEUE_SERIAL);
+      __block BOOL vDone = NO, aDone = NO;
+      dispatch_group_enter(g);
+      [wv requestMediaDataWhenReadyOnQueue:qv usingBlock:^{
+        while (!vDone && wv.isReadyForMoreMediaData) { @autoreleasepool {
+          CMSampleBufferRef sb = [vo copyNextSampleBuffer];
+          if (!sb) { vDone = YES; [wv markAsFinished]; dispatch_group_leave(g); continue; }
+          CVImageBufferRef ib = CMSampleBufferGetImageBuffer(sb);
+          CVPixelBufferRef out = NULL;
+          if (ib && ad.pixelBufferPool) CVPixelBufferPoolCreatePixelBuffer(NULL, ad.pixelBufferPool, &out);
+          if (out) {
+            CIImage *img = [CIImage imageWithCVPixelBuffer:ib];
+            if (o != kCGImagePropertyOrientationUp) img = [img imageByApplyingCGOrientation:o];
+            img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
+            if (img.extent.size.width != W || img.extent.size.height != H)
+              img = [img imageByApplyingTransform:CGAffineTransformMakeScale(W / img.extent.size.width, H / img.extent.size.height)];
+            img = [wm imageByCompositingOverImage:PCSaturate(img, sat2)];
+            PCTag709(out);
+            [ctx render:img toCVPixelBuffer:out bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
+            [ad appendPixelBuffer:out withPresentationTime:CMSampleBufferGetPresentationTimeStamp(sb)];
+            CVPixelBufferRelease(out);
+          }
+          CFRelease(sb);
+        } }
+      }];
+      if (wa) {
+        dispatch_group_enter(g);
+        [wa requestMediaDataWhenReadyOnQueue:qa usingBlock:^{
+          while (!aDone && wa.isReadyForMoreMediaData) {
+            CMSampleBufferRef sb = [ao copyNextSampleBuffer];
+            if (!sb) { aDone = YES; [wa markAsFinished]; dispatch_group_leave(g); break; }
+            [wa appendSampleBuffer:sb]; CFRelease(sb);
+          }
+        }];
+      }
+      if (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC))) != 0 || rd.status == AVAssetReaderStatusFailed) {
+        [rd cancelReading]; [w cancelWriting]; break;
+      }
+      dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+      [w finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+      dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+      ok = w.status == AVAssetWriterStatusCompleted;
+    } while (0);
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (ok) {
+      NSURL *bak = [rec URLByAppendingPathExtension:@"pcbak"];
+      [fm removeItemAtURL:bak error:nil];
+      if ([fm moveItemAtURL:rec toURL:bak error:nil]) {
+        if ([fm moveItemAtURL:tmp toURL:rec error:nil]) [fm removeItemAtURL:bak error:nil];
+        else [fm moveItemAtURL:bak toURL:rec error:nil];        // en cas d'echec : on garde l'enregistrement d'origine
+      }
+    }
+    [fm removeItemAtURL:tmp error:nil];
+    dispatch_async(dispatch_get_main_queue(), done);
+  } });
+}
+
+@interface PCRecProxy : NSObject <AVCaptureFileOutputRecordingDelegate>
+@property (nonatomic, strong) id real;
+@property (nonatomic, strong) NSDictionary *cfg;
+@end
+static NSMutableSet *gRecProxies;
+@implementation PCRecProxy
+- (BOOL)respondsToSelector:(SEL)s { return [super respondsToSelector:s] || [self.real respondsToSelector:s]; }
+- (id)forwardingTargetForSelector:(SEL)s { return self.real; }
+- (void)captureOutput:(AVCaptureFileOutput *)o didFinishRecordingToOutputFileAtURL:(NSURL *)u fromConnections:(NSArray *)cs error:(NSError *)e {
+  id real = self.real;
+  BOOL fine = u.path && [[NSFileManager defaultManager] fileExistsAtPath:u.path] &&
+              (!e || [e.userInfo[AVErrorRecordingSuccessfullyFinishedKey] boolValue]);
+  void (^finish)(void) = ^{
+    [real captureOutput:o didFinishRecordingToOutputFileAtURL:u fromConnections:cs error:e];
+    @synchronized (gRecProxies) { [gRecProxies removeObject:self]; }
+  };
+  if (fine && self.cfg) PCRenderMovie(u, self.cfg, finish); else finish();
+}
+@end
+
 static NSMutableSet *patched;
 static void PCPatch(Class cls) {
   SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
@@ -1155,6 +1528,83 @@ static BOOL PCTargetApp(void) {
       [self canSetSessionPreset:AVCaptureSessionPreset1920x1080]) { %orig(AVCaptureSessionPreset1920x1080); return; }
   %orig;
 }
+- (void)startRunning {                       // icone dispo meme si l'app n'utilise que l'apercu + photo/video
+  %orig;
+  dispatch_async(dispatch_get_main_queue(), ^{ [[PCUI shared] install]; });
+}
+%end
+
+
+// ---------- apercu camera ----------
+%hook AVCaptureVideoPreviewLayer
+- (id)initWithSession:(AVCaptureSession *)s { id r = %orig; [[PCPreview shared] add:r]; return r; }
+- (id)initWithSessionWithNoConnection:(AVCaptureSession *)s { id r = %orig; [[PCPreview shared] add:r]; return r; }
+- (void)setSession:(AVCaptureSession *)s { %orig; [[PCPreview shared] add:self]; }
+- (void)layoutSublayers {
+  %orig;
+  CALayer *ov = objc_getAssociatedObject(self, kPCOverlay);
+  if (ov) { [CATransaction begin]; [CATransaction setDisableActions:YES]; ov.frame = self.bounds; [CATransaction commit]; }
+}
+%end
+
+// ---------- photos ----------
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)st delegate:(id)d {
+  PCShot *sh = PCTakeShot();
+  @synchronized (gShots) {
+    if (gShots.count > 16) [gShots removeAllObjects];
+    if (sh) gShots[@(st.uniqueID)] = sh; else [gShots removeObjectForKey:@(st.uniqueID)];
+  }
+  gLastShot = sh;
+  %orig;
+}
++ (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)a previewPhotoSampleBuffer:(CMSampleBufferRef)b {
+  PCShot *sh = gLastShot; NSData *j = sh ? [sh jpeg] : nil;
+  return j ?: %orig;
+}
+%end
+
+%hook AVCapturePhoto
+- (NSData *)fileDataRepresentation { PCShot *sh = PCShotFor(self); NSData *j = sh ? [sh jpeg] : nil; return j ?: %orig; }
+- (NSData *)fileDataRepresentationWithCustomizer:(id)c { PCShot *sh = PCShotFor(self); NSData *j = sh ? [sh jpeg] : nil; return j ?: %orig; }
+- (NSData *)fileDataRepresentationWithReplacementMetadata:(NSDictionary *)m replacementEmbeddedThumbnailPhotoFormat:(NSDictionary *)f replacementEmbeddedThumbnailPixelBuffer:(CVPixelBufferRef)pb replacementDepthData:(AVDepthData *)dd {
+  PCShot *sh = PCShotFor(self); NSData *j = sh ? [sh jpeg] : nil; return j ?: %orig;
+}
+- (CVPixelBufferRef)pixelBuffer { PCShot *sh = PCShotFor(self); CVPixelBufferRef p = sh ? [sh pixelBuffer] : NULL; return p ?: %orig; }
+- (CVPixelBufferRef)previewPixelBuffer { PCShot *sh = PCShotFor(self); CVPixelBufferRef p = sh ? [sh pixelBuffer] : NULL; return p ?: %orig; }
+- (CGImageRef)CGImageRepresentation { PCShot *sh = PCShotFor(self); CGImageRef c = sh ? [sh cgImage] : NULL; return c ?: %orig; }
+- (CGImageRef)previewCGImageRepresentation { PCShot *sh = PCShotFor(self); CGImageRef c = sh ? [sh cgImage] : NULL; return c ?: %orig; }
+- (NSDictionary *)metadata {                  // l'image prank est deja a l'endroit : pas de rotation supplementaire
+  NSDictionary *m = %orig;
+  if (!PCShotFor(self)) return m;
+  NSMutableDictionary *mm = [m mutableCopy] ?: [NSMutableDictionary new];
+  mm[(id)kCGImagePropertyOrientation] = @1;
+  NSMutableDictionary *tiff = [mm[(id)kCGImagePropertyTIFFDictionary] mutableCopy];
+  if (tiff) { tiff[(id)kCGImagePropertyTIFFOrientation] = @1; mm[(id)kCGImagePropertyTIFFDictionary] = tiff; }
+  return mm;
+}
+%end
+
+%hook AVCaptureStillImageOutput
+- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)c completionHandler:(id)h {
+  gLastShot = PCTakeShot();
+  %orig;
+}
++ (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)sb {
+  PCShot *sh = gLastShot; NSData *j = sh ? [sh jpeg] : nil;
+  return j ?: %orig;
+}
+%end
+
+// ---------- videos enregistrees ----------
+%hook AVCaptureMovieFileOutput
+- (void)startRecordingToOutputFileURL:(NSURL *)url recordingDelegate:(id)d {
+  NSDictionary *cfg = d ? [[PCEngine shared] recordConfig] : nil;
+  if (!cfg) { %orig; return; }
+  PCRecProxy *p = [PCRecProxy new]; p.real = d; p.cfg = cfg;
+  @synchronized (gRecProxies) { [gRecProxies addObject:p]; }
+  %orig(url, p);
+}
 %end
 
 // Apps qui lisent le micro via une AudioUnit (appels WhatsApp / Messenger, WebRTC...) : on remplace les echantillons du micro
@@ -1164,4 +1614,4 @@ static BOOL PCTargetApp(void) {
   return r;
 }
 
-%ctor { patched = [NSMutableSet new]; }
+%ctor { patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new]; }
