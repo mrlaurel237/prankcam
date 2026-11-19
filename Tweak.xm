@@ -410,12 +410,20 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSString *p = [PC_DIR stringByAppendingPathComponent:name];
   if (![[NSFileManager defaultManager] fileExistsAtPath:p]) return NO;
   AVPlayerItem *it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:p]];
-  // meme format qu'en 1.3 (les reglages de couleur demandes au lecteur pouvaient donner une image noire)
-  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
-              @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
-  [it addOutput:self.out];
+  // meme format qu'en 1.3 ; les videos tres lourdes (4K...) sont reduites a 1280 px max par le lecteur :
+  // une image trop grosse a traiter fait sauter des images et l'appel peut croire que la camera est coupee.
   AVAssetTrack *vt = [[it.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+  NSMutableDictionary *pa = [@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                               (id)kCVPixelBufferIOSurfacePropertiesKey: @{}} mutableCopy];
+  CGSize ns = vt ? vt.naturalSize : CGSizeZero;
+  CGFloat big = MAX(ns.width, ns.height);
+  if (big > 1280) {
+    CGFloat k = 1280 / big;
+    pa[(id)kCVPixelBufferWidthKey] = @(((int)lround(ns.width * k)) & ~1);
+    pa[(id)kCVPixelBufferHeightKey] = @(((int)lround(ns.height * k)) & ~1);
+  }
+  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pa];
+  [it addOutput:self.out];
   _srcOrient = vt ? PCOrient(vt.preferredTransform) : kCGImagePropertyOrientationUp;
   AVAssetTrack *at = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
   if (at) {
@@ -959,7 +967,7 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   self.webLbl = [self hint:@""]; [st addArrangedSubview:self.webLbl]; [self refreshWeb];
   UIButton *wb = PCBtn(@"", self, @selector(toggleWM:)); [self titleWM:wb];
   [st addArrangedSubview:wb];
-  [st addArrangedSubview:PCRow(@"Qualité maximale (1080p, relance l'app)", [self sw:PCBool(E.prefs[@"hq"], YES) action:@selector(swHQ:)])];
+  [st addArrangedSubview:PCRow(@"Qualité maximale 1080p (Snapchat / TikTok, relance l'app)", [self sw:PCBool(E.prefs[@"hq2"], NO) action:@selector(swHQ:)])];
   [st addArrangedSubview:PCBtn(@"Masquer les boutons (point discret)", self, @selector(hideAll))];
   [st addArrangedSubview:[self hint:@"Icône 🎥 : tap = ON/OFF · appui long = cette télécommande · glisser = déplacer.\n"
                                      "Bouton 0 : retour au début de la vidéo · appui long = début en pause.\n"
@@ -1102,7 +1110,7 @@ static void PCSliderText(UISlider *s) {
   E.prefs[@"wm_top"] = @(!PCBool(E.prefs[@"wm_top"], NO)); [E savePrefs];
   [self titleWM:b];
 }
-- (void)swHQ:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.prefs[@"hq"] = @(s.on); [E savePrefs]; }
+- (void)swHQ:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.prefs[@"hq2"] = @(s.on); [E savePrefs]; }
 - (void)swMini:(UISwitch *)s {
   PCEngine *E = [PCEngine shared]; E.prefs[@"mini"] = @(s.on); [E savePrefs];
   self.mini.hidden = !s.on;
@@ -1529,15 +1537,24 @@ static BOOL PCTargetApp(void) {
   });
   return r;
 }
-%hook AVCaptureSession      // qualite maximale : prefere 1080p aux petits presets (si la camera le permet)
+// Qualite maximale (option, OFF par defaut) : forcait le 1080p, y compris dans WhatsApp, ce qui coupait l'image
+// des appels video meme camera prank desactivee (les appels demandent une petite resolution).
+// Desormais : installe seulement si l'option est activee, et jamais dans WhatsApp / Messenger.
+static BOOL PCHQApp(void) {
+  NSString *b = NSBundle.mainBundle.bundleIdentifier ?: @"";
+  return [@[@"com.toyopagroup.picaboo", @"com.zhiliaoapp.musically"] containsObject:b];
+}
+%group PCHQ
+%hook AVCaptureSession
 - (void)setSessionPreset:(AVCaptureSessionPreset)preset {
-  if (PCTargetApp() && PCBool([PCEngine shared].prefs[@"hq"], YES) &&
+  if (PCBool([PCEngine shared].prefs[@"hq2"], NO) &&
       ([preset isEqualToString:AVCaptureSessionPresetMedium] || [preset isEqualToString:AVCaptureSessionPresetLow] ||
        [preset isEqualToString:AVCaptureSessionPreset640x480] || [preset isEqualToString:AVCaptureSessionPreset1280x720] ||
        [preset isEqualToString:@"AVCaptureSessionPreset960x540"]) &&
       [self canSetSessionPreset:AVCaptureSessionPreset1920x1080]) { %orig(AVCaptureSessionPreset1920x1080); return; }
   %orig;
 }
+%end
 %end
 
 
@@ -1622,6 +1639,7 @@ static void PCCaptureHooksOn(void) {
 
 %ctor {
   %init;                                          // hooks de base (camera des appels / notes video, micro)
+  if (PCHQApp() && PCBool([PCEngine shared].prefs[@"hq2"], NO)) %init(PCHQ);
   patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new];
   if (PCTargetApp() && PCCaptureOn()) {           // option photos/videos : hooks + icone dans l'appareil photo
     PCCaptureHooksOn();

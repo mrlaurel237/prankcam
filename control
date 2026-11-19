@@ -1,6 +1,6 @@
 Package: com.chuck.prankcampro
 Name: PrankCam Pro
-Version: 1.6.0
+Version: 1.6.1
 Architecture: iphoneos-arm64
 Description: Prank cam : icone flottante (1 tap = ON/OFF), mini-telecommande avec bouton 0 (retour au debut), reperes nommes, son video, telecommande web. Bandeau LIVE PRANK toujours visible.
 Maintainer: Chuck
