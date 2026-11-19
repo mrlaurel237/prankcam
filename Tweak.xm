@@ -84,6 +84,7 @@ static CIImage *PCSaturate(CIImage *img, float sat) {
   [cc setValue:img forKey:kCIInputImageKey]; [cc setValue:@(sat) forKey:kCIInputSaturationKey];
   return cc.outputImage ?: img;
 }
+static void PCPreviewStart(void);
 static float PCFloat(id v, float def) { return [v isKindOfClass:NSNumber.class] ? [v floatValue] : def; }
 // gains audio lus depuis les threads audio (simples floats : pas de verrou necessaire)
 static volatile float gMonGain  = 0.8f;   // volume d'ecoute de la video sur l'iPhone (0 = muet)
@@ -339,6 +340,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
 }
 // ----- commandes de lecture -----
 - (void)setOn:(BOOL)on {                        // activation : icone flottante, panneau ou telecommande web
+  if (on) PCPreviewStart();
   if (on && !self.enabled) {
     if (self.zeroOnActivate) [self restart:YES];
     else [self go];
@@ -1193,8 +1195,10 @@ static const void *kPCOverlay = &kPCOverlay;
 @property (nonatomic, strong) CADisplayLink *link;
 @property (nonatomic) NSUInteger lastGen;
 @property (nonatomic) BOOL shown;
+@property (nonatomic) NSUInteger scan;
 + (instancetype)shared;
 - (void)add:(CALayer *)l;
+- (void)start;
 @end
 @implementation PCPreview
 + (instancetype)shared {
@@ -1202,15 +1206,24 @@ static const void *kPCOverlay = &kPCOverlay;
   dispatch_once(&o, ^{ p = [PCPreview new]; p.layers = [NSHashTable weakObjectsHashTable]; });
   return p;
 }
-- (void)add:(CALayer *)l {
-  if (!l) return;
-  if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self add:l]; }); return; }
-  [self.layers addObject:l];
-  [[PCUI shared] install];
-  if (!self.link) {
-    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    self.link.preferredFramesPerSecond = 30;
-    [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+- (void)add:(CALayer *)l { if (l) [self.layers addObject:l]; }
+- (void)start {                                   // appele quand la camera prank passe ON
+  if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self start]; }); return; }
+  if (self.link) return;
+  self.scan = 0;
+  self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+  self.link.preferredFramesPerSecond = 30;
+  [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+static void PCFindPreviews(CALayer *l, int depth, PCPreview *p) {   // lecture seule de l'arbre des calques
+  if (!l || depth > 40) return;
+  if ([l isKindOfClass:AVCaptureVideoPreviewLayer.class]) { [p add:l]; return; }
+  for (CALayer *c in [l.sublayers copy]) PCFindPreviews(c, depth + 1, p);
+}
+- (void)rescan {
+  for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+    if (![sc isKindOfClass:UIWindowScene.class]) continue;
+    for (UIWindow *w in ((UIWindowScene *)sc).windows) if (![w isKindOfClass:PCWindow.class]) PCFindPreviews(w.layer, 0, self);
   }
 }
 static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu (effet miroir) ?
@@ -1225,16 +1238,16 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
   PCEngine *E = [PCEngine shared];
   BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], YES);
   NSArray *ls = self.layers.allObjects;
-  if (!want) {
-    if (self.shown) {
-      for (CALayer *l in ls) {
-        CALayer *ov = objc_getAssociatedObject(l, kPCOverlay);
-        if (ov) { ov.hidden = YES; ov.contents = nil; }
-      }
-      self.shown = NO;
+  if (!want) {                                     // OFF : on retire tout et on s'arrete (aucun effet sur l'app)
+    for (CALayer *l in ls) {
+      CALayer *ov = objc_getAssociatedObject(l, kPCOverlay);
+      if (ov) { [ov removeFromSuperlayer]; objc_setAssociatedObject(l, kPCOverlay, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     }
+    self.shown = NO;
+    if (!E.enabled) { [self.link invalidate]; self.link = nil; }
     return;
   }
+  if ((self.scan++ % 15) == 0) { [self rescan]; ls = self.layers.allObjects; }   // ~2 fois par seconde
   BOOL any = NO;
   for (CALayer *l in ls) if (l.superlayer && !l.hidden) { any = YES; break; }
   if (!any) return;
@@ -1267,6 +1280,8 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
   self.shown = YES;
 }
 @end
+
+static void PCPreviewStart(void) { [[PCPreview shared] start]; }
 
 // ---------- photos : AVCapturePhotoOutput / AVCaptureStillImageOutput ----------
 @interface PCShot : NSObject {
@@ -1525,24 +1540,9 @@ static BOOL PCTargetApp(void) {
       [self canSetSessionPreset:AVCaptureSessionPreset1920x1080]) { %orig(AVCaptureSessionPreset1920x1080); return; }
   %orig;
 }
-- (void)startRunning {                       // icone dispo meme si l'app n'utilise que l'apercu + photo/video
-  %orig;
-  dispatch_async(dispatch_get_main_queue(), ^{ [[PCUI shared] install]; });
-}
 %end
 
 
-// ---------- apercu camera ----------
-%hook AVCaptureVideoPreviewLayer
-- (id)initWithSession:(AVCaptureSession *)s { id r = %orig; [[PCPreview shared] add:r]; return r; }
-- (id)initWithSessionWithNoConnection:(AVCaptureSession *)s { id r = %orig; [[PCPreview shared] add:r]; return r; }
-- (void)setSession:(AVCaptureSession *)s { %orig; [[PCPreview shared] add:self]; }
-- (void)layoutSublayers {
-  %orig;
-  CALayer *ov = objc_getAssociatedObject(self, kPCOverlay);
-  if (ov) { [CATransaction begin]; [CATransaction setDisableActions:YES]; ov.frame = self.bounds; [CATransaction commit]; }
-}
-%end
 
 // ---------- photos ----------
 %hook AVCapturePhotoOutput
@@ -1611,4 +1611,9 @@ static BOOL PCTargetApp(void) {
   return r;
 }
 
-%ctor { patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new]; }
+%ctor {
+  patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new];
+  if (PCTargetApp())                              // icone dispo aussi dans l'appareil photo (pas seulement en appel)
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+      queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) { [[PCUI shared] install]; }];
+}
