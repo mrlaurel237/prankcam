@@ -46,6 +46,11 @@ static BOOL PCIsIOUnit(AudioUnit u) {   // unite d'entree micro (RemoteIO / Voic
          (d.componentSubType == kAudioUnitSubType_RemoteIO || d.componentSubType == kAudioUnitSubType_VoiceProcessingIO);
 }
 static BOOL PCBool(id v, BOOL def) { return [v isKindOfClass:NSNumber.class] ? [v boolValue] : def; }
+static float PCFloat(id v, float def) { return [v isKindOfClass:NSNumber.class] ? [v floatValue] : def; }
+// gains audio lus depuis les threads audio (simples floats : pas de verrou necessaire)
+static volatile float gMonGain  = 0.8f;   // volume d'ecoute de la video sur l'iPhone (0 = muet)
+static volatile float gSendGain = 1.0f;   // volume de la video envoyee a la place du micro (0..2)
+static volatile BOOL  gMixMic   = NO;     // ajouter ma voix (micro) au son de la video envoye
 static NSArray<NSString *> *PCVideos(void) {
   NSMutableArray *vids = [NSMutableArray new];
   for (NSString *f in [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:PC_DIR error:nil] sortedArrayUsingSelector:@selector(compare:)])
@@ -76,6 +81,11 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 @property (nonatomic) BOOL loop;                  // boucle a la fin (sinon : reste sur la derniere image)
 @property (nonatomic) BOOL zeroOnActivate;        // repartir a 0 a chaque activation
 @property (nonatomic) BOOL webOn;                 // telecommande web (OFF par defaut)
+@property (nonatomic) BOOL monitorOn;             // entendre la video sur l'iPhone (ON par defaut)
+@property (nonatomic) float monitorVol;           // volume d'ecoute 0..1
+@property (nonatomic) float sendVol;              // volume de la video envoyee 0..2
+@property (nonatomic) BOOL mixMic;                // envoyer video + ma voix
+@property (nonatomic) float saturation;           // 1 = couleurs d'origine de la video
 @property (nonatomic, strong) NSMutableDictionary *prefs; // reglages persistants (settings.json)
 @property (nonatomic, strong) AVPlayer *player;
 @property (nonatomic, strong) AVPlayerItemVideoOutput *out;
@@ -90,6 +100,8 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 - (void)flush;
 - (BOOL)load:(NSString *)f;
 - (void)setOn:(BOOL)on;
+- (void)go;
+- (void)applyAudio;
 - (void)restart:(BOOL)play;
 - (void)togglePlay;
 - (void)seekBy:(double)d;
@@ -114,7 +126,13 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
                        AudioBufferList *abl, CMItemCount *nOut, MTAudioProcessingTapFlags *flOut) {
   if (MTAudioProcessingTapGetSourceAudio(t, n, abl, flOut, NULL, nOut) != noErr) return;
   [[PCEngine shared] pushABL:abl frames:(UInt32)*nOut];
-  for (UInt32 b = 0; b < abl->mNumberBuffers; b++) memset(abl->mBuffers[b].mData, 0, abl->mBuffers[b].mDataByteSize); // pas de son local
+  float g = gMonGain;                              // son local : volume d'ecoute (0 = muet)
+  for (UInt32 b = 0; b < abl->mNumberBuffers; b++) {
+    float *d = (float *)abl->mBuffers[b].mData; if (!d) continue;
+    UInt32 n2 = abl->mBuffers[b].mDataByteSize / sizeof(float);
+    if (g <= 0.001f) memset(d, 0, abl->mBuffers[b].mDataByteSize);
+    else if (g < 0.999f) for (UInt32 i = 0; i < n2; i++) d[i] *= g;
+  }
 }
 
 @implementation PCEngine
@@ -137,18 +155,47 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
     _loop = PCBool(_prefs[@"loop"], YES);
     _zeroOnActivate = PCBool(_prefs[@"zero"], YES);
     _webOn = PCBool(_prefs[@"web"], NO);
+    _monitorOn = PCBool(_prefs[@"mon"], YES);
+    _monitorVol = MAX(0.f, MIN(1.f, PCFloat(_prefs[@"mon_vol"], 0.8f)));
+    _sendVol = MAX(0.f, MIN(2.f, PCFloat(_prefs[@"send_vol"], 1.0f)));
+    _mixMic = PCBool(_prefs[@"mix"], NO);
+    _saturation = MAX(0.f, MIN(1.5f, PCFloat(_prefs[@"sat"], 1.0f)));
+    [self applyAudio];
   }
   return self;
 }
 - (void)savePrefs {
   _prefs[@"audio"] = @(_audioOn); _prefs[@"loop"] = @(_loop);
   _prefs[@"zero"] = @(_zeroOnActivate); _prefs[@"web"] = @(_webOn);
+  _prefs[@"mon"] = @(_monitorOn); _prefs[@"mon_vol"] = @(_monitorVol); _prefs[@"send_vol"] = @(_sendVol);
+  _prefs[@"mix"] = @(_mixMic); _prefs[@"sat"] = @(_saturation);
+  [self applyAudio];
   NSData *d = [NSJSONSerialization dataWithJSONObject:_prefs options:0 error:nil];
   [d writeToFile:[PC_DIR stringByAppendingPathComponent:@"settings.json"] atomically:YES];
 }
 - (void)saveCues {
   NSData *d = [NSJSONSerialization dataWithJSONObject:_cues options:0 error:nil];
   [d writeToFile:[PC_DIR stringByAppendingPathComponent:@"cues.json"] atomically:YES];
+}
+- (void)applyAudio {
+  gMonGain = self.monitorOn ? self.monitorVol : 0.f;
+  gSendGain = self.sendVol; gMixMic = self.mixMic;
+}
+// lecture + son audible tout de suite : si l'app a mis le son dans l'ecouteur (appel) on bascule sur le haut-parleur,
+// et si la session est "ambiante" (coupee par le bouton silence) on la passe en lecture.
+- (void)go {
+  if (self.monitorOn && self.monitorVol > 0.001f) {
+    AVAudioSession *as = [AVAudioSession sharedInstance];
+    NSString *cat = as.category;
+    if ([cat isEqualToString:AVAudioSessionCategoryAmbient] || [cat isEqualToString:AVAudioSessionCategorySoloAmbient]) {
+      [as setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+      [as setActive:YES error:nil];
+    } else if ([cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+      for (AVAudioSessionPortDescription *o in as.currentRoute.outputs)
+        if ([o.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) { [as overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil]; break; }
+    }
+  }
+  [self.player play];
 }
 - (void)tapRate:(double)r ch:(UInt32)c nonInter:(BOOL)ni { _tapRate = r; _tapCh = MAX(c, 1); _tapNonInter = ni; }
 - (void)flush { os_unfair_lock_lock(&_lock); _rp = (double)_wp; os_unfair_lock_unlock(&_lock); }
@@ -199,12 +246,16 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (!fr || fr > PC_MAXF || !ch) return;
   float tmp[PC_MAXF];
   [self pull:tmp frames:fr ratio:_tapRate / a->mSampleRate];
+  float sg = gSendGain; BOOL mix = gMixMic;
   for (UInt32 i = 0; i < fr; i++) {
-    float s = tmp[i];
+    float v = tmp[i] * sg;
     for (UInt32 c = 0; c < ch; c++) {
       size_t idx = planar ? (size_t)c * fr + i : (size_t)i * ch + c;
+      float s = v;
+      if (mix) s += flt ? ((float *)p)[idx] : ((int16_t *)p)[idx] / 32768.f;   // + ma voix
+      s = MAX(-1.f, MIN(1.f, s));
       if (flt) ((float *)p)[idx] = s;
-      else ((int16_t *)p)[idx] = (int16_t)(MAX(-1.f, MIN(1.f, s)) * 32767);
+      else ((int16_t *)p)[idx] = (int16_t)(s * 32767);
     }
   }
 }
@@ -223,15 +274,20 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (bps != 2 && bps != 4) return;                // int16 ou float32 uniquement
   float tmp[PC_MAXF];
   [self pull:tmp frames:fr ratio:_tapRate / crate];
+  float sg = gSendGain; BOOL mix = gMixMic;
   for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
     AudioBuffer *ab = &io->mBuffers[b];
     UInt32 ch = ab->mNumberChannels ?: 1;
     if (!ab->mData || (size_t)fr * ch * bps > ab->mDataByteSize) continue;
     for (UInt32 i = 0; i < fr; i++) {
-      float s = MAX(-1.f, MIN(1.f, tmp[i]));
+      float v = tmp[i] * sg;
       for (UInt32 c = 0; c < ch; c++) {
-        if (bps == 4) ((float *)ab->mData)[i * ch + c] = s;
-        else ((int16_t *)ab->mData)[i * ch + c] = (int16_t)(s * 32767);
+        size_t k = (size_t)i * ch + c;
+        float s = v;
+        if (mix) s += bps == 4 ? ((float *)ab->mData)[k] : ((int16_t *)ab->mData)[k] / 32768.f;   // + ma voix
+        s = MAX(-1.f, MIN(1.f, s));
+        if (bps == 4) ((float *)ab->mData)[k] = s;
+        else ((int16_t *)ab->mData)[k] = (int16_t)(s * 32767);
       }
     }
   }
@@ -240,7 +296,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
 - (void)setOn:(BOOL)on {                        // activation : icone flottante, panneau ou telecommande web
   if (on && !self.enabled) {
     if (self.zeroOnActivate) [self restart:YES];
-    else [self.player play];
+    else [self go];
   } else if (!on && self.enabled) {
     [self.player pause];                        // la video attend ici (ou repart a 0 a la prochaine activation)
   }
@@ -255,13 +311,13 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
     dispatch_async(dispatch_get_main_queue(), ^{
       PCEngine *s = ws; if (!s) return;
       [s flush];
-      if (play) [s.player play];
+      if (play) [s go];
     });
   }];
 }
 - (void)togglePlay {
   if (!self.player.currentItem) return;
-  if (self.player.rate > 0) [self.player pause]; else [self.player play];
+  if (self.player.rate > 0) [self.player pause]; else [self go];
 }
 - (void)seekBy:(double)d {
   if (!self.player.currentItem) return;
@@ -272,7 +328,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSNumber *t = ((NSDictionary *)self.cues[self.current ?: @""])[n];
   if (![t isKindOfClass:NSNumber.class] || !self.player) return;
   [self.player seekToTime:CMTimeMakeWithSeconds(t.doubleValue, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
-  [self flush]; [self.player play];
+  [self flush]; [self go];
 }
 - (void)markCue:(NSString *)n {
   if (!self.current || !n.length) return;
@@ -305,9 +361,15 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSString *p = [PC_DIR stringByAppendingPathComponent:name];
   if (![[NSFileManager defaultManager] fileExistsAtPath:p]) return NO;
   AVPlayerItem *it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:p]];
-  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
+  // couleurs : on demande une image SDR BT.709 (les videos HDR / Dolby Vision de l'iPhone sont converties
+  // proprement au lieu d'etre ecrasees et sur-saturees)
+  self.out = [[AVPlayerItemVideoOutput alloc] initWithOutputSettings:
               @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                AVVideoAllowWideColorKey: @NO,
+                AVVideoColorPropertiesKey: @{AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                             AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                             AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2}}];
   [it addOutput:self.out];
   AVAssetTrack *at = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
   if (at) {
@@ -330,9 +392,9 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   _endObs = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
     object:it queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
       PCEngine *s = ws; if (!s || !s.loop) return;   // sans boucle : reste fige sur la derniere image
-      [s.player seekToTime:kCMTimeZero]; [s.player play]; }];
+      [s.player seekToTime:kCMTimeZero]; [s go]; }];
   self.prefs[@"last"] = name; [self savePrefs];
-  if (self.enabled) [self.player play]; else [self.player pause];   // inactif : la video attend au debut
+  if (self.enabled) [self go]; else [self.player pause];   // inactif : la video attend au debut
   return YES;
 }
 - (CIImage *)wmForSize:(CGSize)s {
@@ -363,6 +425,12 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   if (src) { if (_last) CVPixelBufferRelease(_last); _last = src; }
   if (!_last) return NULL;
   CIImage *img = [CIImage imageWithCVPixelBuffer:_last];
+  float sat = self.saturation;
+  if (fabsf(sat - 1.f) > 0.01f) {                 // reglage saturation (100 % = couleurs d'origine)
+    CIFilter *cc = [CIFilter filterWithName:@"CIColorControls"];
+    [cc setValue:img forKey:kCIInputImageKey]; [cc setValue:@(sat) forKey:kCIInputSaturationKey];
+    img = cc.outputImage ?: img;
+  }
   // 1) bandeau obligatoire, dans le repere de la video (en bas de l'image)
   img = [[self wmForSize:img.extent.size] imageByCompositingOverImage:img];
   // 2) video portrait dans un buffer camera paysage -> rotation (si c'est de travers, inverse le signe)
@@ -387,7 +455,14 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
   CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
   if (!dst) return NULL;
-  [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:nil];
+  // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
+  // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB et on etiquette le buffer en BT.709.
+  static CGColorSpaceRef srgb; static dispatch_once_t once;
+  dispatch_once(&once, ^{ srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB); });
+  CVBufferSetAttachment(dst, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(dst, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(dst, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+  [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:srgb];
   CMVideoFormatDescriptionRef fd = NULL;
   CMVideoFormatDescriptionCreateForImageBuffer(NULL, dst, &fd);
   CMSampleTimingInfo ti; CMSampleBufferGetSampleTimingInfo(sb, 0, &ti);
@@ -440,7 +515,7 @@ r();setInterval(r,1500)
   else if ([p isEqualToString:@"/zero"]) [self restart:YES];
   else if ([p isEqualToString:@"/ready"]) [self restart:NO];
   else if ([p isEqualToString:@"/playpause"]) [self togglePlay];
-  else if ([p isEqualToString:@"/play"]) [self.player play];
+  else if ([p isEqualToString:@"/play"]) [self go];
   else if ([p isEqualToString:@"/pause"]) [self.player pause];
   else if ([p isEqualToString:@"/audio_on"]) { self.audioOn = YES; [self savePrefs]; }
   else if ([p isEqualToString:@"/audio_off"]) { self.audioOn = NO; [self savePrefs]; }
@@ -793,7 +868,19 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   [st addArrangedSubview:cs]; self.cueStack = cs;
   // reglages
   [st addArrangedSubview:PCLabel(@"Réglages", 15, YES)];
-  [st addArrangedSubview:PCRow(@"Micro coupé : n'envoyer que le son de la vidéo", [self sw:E.audioOn action:@selector(swAudio:)])];
+  [st addArrangedSubview:PCLabel(@"Son", 15, YES)];
+  [st addArrangedSubview:PCRow(@"Entendre la vidéo sur mon iPhone", [self sw:E.monitorOn action:@selector(swMonitor:)])];
+  [st addArrangedSubview:[self sliderRow:@"Volume d'écoute" min:0 max:1 value:E.monitorVol action:@selector(slMonitor:)]];
+  [st addArrangedSubview:PCRow(@"Envoyer le son de la vidéo (à la place du micro)", [self sw:E.audioOn action:@selector(swAudio:)])];
+  [st addArrangedSubview:[self sliderRow:@"Volume de la vidéo envoyée" min:0 max:2 value:E.sendVol action:@selector(slSend:)]];
+  [st addArrangedSubview:PCRow(@"Ajouter ma voix au son de la vidéo", [self sw:E.mixMic action:@selector(swMix:)])];
+  [st addArrangedSubview:[self hint:@"Écoute : le son de la vidéo sort du haut-parleur dès qu'elle joue.\n"
+                                     "Envoi coupé = c'est ton micro qui est envoyé. « Ajouter ma voix » mélange proprement ta voix et la vidéo "
+                                     "(avec des écouteurs, le haut-parleur n'est pas repris par le micro)."]];
+  [st addArrangedSubview:PCLabel(@"Image", 15, YES)];
+  [st addArrangedSubview:[self sliderRow:@"Saturation" min:0 max:1.5 value:E.saturation action:@selector(slSat:)]];
+  [st addArrangedSubview:PCBtn(@"Couleurs d'origine (100 %)", self, @selector(resetSat))];
+  [st addArrangedSubview:PCLabel(@"Lecture", 15, YES)];
   [st addArrangedSubview:PCRow(@"Repartir à 0 à chaque activation", [self sw:E.zeroOnActivate action:@selector(swZero:)])];
   [st addArrangedSubview:PCRow(@"Boucle (sinon reste sur la dernière image)", [self sw:E.loop action:@selector(swLoop:)])];
   [st addArrangedSubview:PCRow(@"Mini-télécommande flottante", [self sw:PCBool(E.prefs[@"mini"], YES) action:@selector(swMini:)])];
@@ -891,6 +978,43 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
 }
 - (void)swEnable:(UISwitch *)s { [[PCEngine shared] setOn:s.on]; [self tick]; }
 - (void)swAudio:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.audioOn = s.on; [E savePrefs]; }
+- (void)swMonitor:(UISwitch *)s {
+  PCEngine *E = [PCEngine shared]; E.monitorOn = s.on; [E savePrefs];
+  if (s.on && E.player.rate > 0) [E go];          // bascule sur le haut-parleur si besoin
+}
+- (void)swMix:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.mixMic = s.on; [E savePrefs]; }
+static const void *kPCSliderLbl = &kPCSliderLbl;
+static void PCSliderText(UISlider *s) {
+  UILabel *l = objc_getAssociatedObject(s, kPCSliderLbl);
+  l.text = [NSString stringWithFormat:@"%@ : %d %%", s.accessibilityLabel, (int)lroundf(s.value * 100)];
+}
+- (UIView *)sliderRow:(NSString *)t min:(float)a max:(float)b value:(float)v action:(SEL)sel {
+  UIStackView *r = [UIStackView new]; r.axis = UILayoutConstraintAxisVertical; r.spacing = 2;
+  UILabel *l = PCLabel(@"", 14, NO);
+  UISlider *s = [UISlider new]; s.minimumValue = a; s.maximumValue = b; s.value = v; s.accessibilityLabel = t;
+  objc_setAssociatedObject(s, kPCSliderLbl, l, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  [s addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
+  [r addArrangedSubview:l]; [r addArrangedSubview:s]; PCSliderText(s);
+  return r;
+}
+- (void)slMonitor:(UISlider *)s {
+  PCEngine *E = [PCEngine shared]; E.monitorVol = s.value; PCSliderText(s);
+  [E savePrefs];
+}
+- (void)slSend:(UISlider *)s {
+  if (fabsf(s.value - 1.f) < 0.04f) s.value = 1.f;     // petit cran a 100 %
+  PCEngine *E = [PCEngine shared]; E.sendVol = s.value; PCSliderText(s);
+  [E savePrefs];
+}
+- (void)slSat:(UISlider *)s {
+  if (fabsf(s.value - 1.f) < 0.04f) s.value = 1.f;     // petit cran a 100 % = couleurs d'origine
+  PCEngine *E = [PCEngine shared]; E.saturation = s.value; PCSliderText(s);
+  [E savePrefs];
+}
+- (void)resetSat {
+  PCEngine *E = [PCEngine shared]; E.saturation = 1.f; [E savePrefs];
+  [self closePanel]; [self buildPanel];
+}
 - (void)swZero:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.zeroOnActivate = s.on; [E savePrefs]; }
 - (void)swLoop:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.loop = s.on; [E savePrefs]; }
 - (void)titleWM:(UIButton *)b {

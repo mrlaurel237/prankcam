@@ -12,6 +12,11 @@ Tweak rootless (iOS 15+, Dopamine / palera1n, ElleKit ou Substrate) qui remplace
   - `⏯` = lecture / pause.
 - **Télécommande complète** : ON/OFF, 0, lecture/pause, curseur, -5s/-1s/+1s/+5s, choix ou ajout de vidéos (Photos / Fichiers), repères nommés, réglages :
   - son de la vidéo (ou ton micro), repartir à 0 à chaque activation (activé par défaut), boucle, mini-télécommande, télécommande web, masquer les boutons (un petit point les fait revenir).
+- **Son** (réglages) :
+  - *Entendre la vidéo sur mon iPhone* (activé par défaut) + *Volume d'écoute* : le son de la vidéo sort du haut-parleur dès qu'elle joue (bascule automatiquement de l'écouteur vers le haut-parleur, et n'est plus coupé par le bouton silence).
+  - *Envoyer le son de la vidéo* (à la place du micro) + *Volume de la vidéo envoyée* (0 à 200 %).
+  - *Ajouter ma voix* : envoie la vidéo + ton micro mélangés proprement (de préférence avec des écouteurs).
+- **Image** : les couleurs sont maintenant rendues en sRGB / BT.709 (avant, l'image sortait sans gestion des couleurs : trop contrastée et trop saturée ; les vidéos HDR de l'iPhone sont aussi converties correctement). Curseur *Saturation* + bouton *Couleurs d'origine*.
 - **Télécommande web** (désactivée par défaut) : depuis un autre téléphone sur le même Wi-Fi, ouvre l'adresse affichée dans les réglages (`http://IP-de-l-iPhone:8765`).
 
 Les vidéos, les repères et les réglages sont gardés dans le dossier `PrankCam` de l'app, donc les vidéos déjà importées avec PrankCam restent disponibles.
