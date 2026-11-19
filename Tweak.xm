@@ -1621,6 +1621,7 @@ static void PCCaptureHooksOn(void) {
 }
 
 %ctor {
+  %init;                                          // hooks de base (camera des appels / notes video, micro)
   patched = [NSMutableSet new]; gShots = [NSMutableDictionary new]; gRecProxies = [NSMutableSet new];
   if (PCTargetApp() && PCCaptureOn()) {           // option photos/videos : hooks + icone dans l'appareil photo
     PCCaptureHooksOn();
