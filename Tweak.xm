@@ -1027,7 +1027,7 @@ static BOOL PCTargetApp(void) {
   if (PCTargetApp() && PCBool([PCEngine shared].prefs[@"hq"], YES) &&
       ([preset isEqualToString:AVCaptureSessionPresetMedium] || [preset isEqualToString:AVCaptureSessionPresetLow] ||
        [preset isEqualToString:AVCaptureSessionPreset640x480] || [preset isEqualToString:AVCaptureSessionPreset1280x720] ||
-       [preset isEqualToString:AVCaptureSessionPreset960x540]) &&
+       [preset isEqualToString:@"AVCaptureSessionPreset960x540"]) &&
       [self canSetSessionPreset:AVCaptureSessionPreset1920x1080]) { %orig(AVCaptureSessionPreset1920x1080); return; }
   %orig;
 }

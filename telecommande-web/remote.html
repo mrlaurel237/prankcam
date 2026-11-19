@@ -1,0 +1,26 @@
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{font-family:-apple-system,sans-serif;background:#111;color:#fff;margin:12px}
+button{font-size:20px;padding:16px;margin:4px;border:0;border-radius:12px;background:#2a6df4;color:#fff}
+.off{background:#d33}.on{background:#2a2}.g{background:#444}.cue{min-width:46%}.big{font-size:30px;min-width:46%;padding:22px}
+#tg{width:96%}select,input{font-size:18px;padding:10px;margin:4px;border-radius:8px;border:0}</style>
+<h2>PrankCam Pro</h2><div id=st></div>
+<div><button id=tg class=off onclick="c('toggle')">...</button></div>
+<div><button class=big onclick="c('zero')">&#9198; 0</button><button class="big g" onclick="c('playpause')">&#9199;</button></div>
+<div><button class=g onclick="c('seek?d=-5')">-5s</button><button class=g onclick="c('ready')">0 + pause</button><button class=g onclick="c('seek?d=5')">+5s</button></div>
+<div><button class=g onclick="c('audio_on')">Son video</button><button class=g onclick="c('audio_off')">Mon micro</button></div>
+<div><button class=g onclick="c('loop_on')">Boucle ON</button><button class=g onclick="c('loop_off')">Boucle OFF</button></div>
+<select id=v onchange="if(this.value)c('load?f='+encodeURIComponent(this.value))"></select>
+<button class=g onclick="let f=document.getElementById('v').value;if(f&&confirm('Supprimer cette video ?'))c('delvideo?f='+encodeURIComponent(f))">Supprimer la video</button>
+<h3>Reperes</h3><div id=cues></div>
+<div><input id=n placeholder="Nom du repere"><button class=g onclick="mark()">Marquer ici</button></div>
+<script>
+async function c(p){await fetch('/'+p);r()}
+function mark(){let n=document.getElementById('n').value.trim();if(n)c('mark?n='+encodeURIComponent(n))}
+function esc(x){return String(x).replace(/[&<>"']/g,m=>'&#'+m.charCodeAt(0)+';')}
+async function r(){let s=await (await fetch('/state')).json();
+let tg=document.getElementById('tg');tg.className=s.enabled?'on':'off';tg.textContent=s.enabled?'ACTIF (toucher pour couper)':'INACTIF (toucher pour activer)';
+document.getElementById('st').textContent=(s.playing?'lecture':'pause')+' - son '+(s.audio?'video':'micro')+' - boucle '+(s.loop?'ON':'OFF')+' - '+(s.current||'aucune video')+' - '+s.time.toFixed(1)+'s / '+s.dur.toFixed(1)+'s';
+let v=document.getElementById('v');if(v.options.length!=s.videos.length+1){v.innerHTML='<option value="">Choisir une video</option>'+s.videos.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join('')}
+document.getElementById('cues').innerHTML=Object.keys(s.cues).map(k=>'<button class=cue data-n="'+esc(k)+'" onclick="c(\'cue?n=\'+encodeURIComponent(this.dataset.n))">'+esc(k)+' ('+s.cues[k].toFixed(1)+'s)</button>').join('')}
+r();setInterval(r,1500)
+</script>
