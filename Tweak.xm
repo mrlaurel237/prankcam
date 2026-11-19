@@ -406,15 +406,10 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSString *p = [PC_DIR stringByAppendingPathComponent:name];
   if (![[NSFileManager defaultManager] fileExistsAtPath:p]) return NO;
   AVPlayerItem *it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:p]];
-  // couleurs : on demande une image SDR BT.709 (les videos HDR / Dolby Vision de l'iPhone sont converties
-  // proprement au lieu d'etre ecrasees et sur-saturees)
-  self.out = [[AVPlayerItemVideoOutput alloc] initWithOutputSettings:
+  // meme format qu'en 1.3 (les reglages de couleur demandes au lecteur pouvaient donner une image noire)
+  self.out = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
               @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-                AVVideoAllowWideColorKey: @NO,
-                AVVideoColorPropertiesKey: @{AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                                             AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                                             AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2}}];
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
   [it addOutput:self.out];
   AVAssetTrack *vt = [[it.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
   _srcOrient = vt ? PCOrient(vt.preferredTransform) : kCGImagePropertyOrientationUp;
@@ -488,7 +483,6 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
   CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
   if (!dst) return NULL;
-  PCTag709(dst);
   [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
   return dst;
 }
@@ -530,8 +524,7 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
   if (!dst) return NULL;
   // avant : colorSpace:nil = pas de gestion des couleurs -> l'image sortait en valeurs lineaires
-  // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB et on etiquette le buffer en BT.709.
-  PCTag709(dst);
+  // (plus sombre, plus contrastee, couleurs trop saturees). On rend en sRGB.
   [self.ci render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:PCSRGB()];
   CMVideoFormatDescriptionRef fd = NULL;
   CMVideoFormatDescriptionCreateForImageBuffer(NULL, dst, &fd);
@@ -1224,9 +1217,9 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
   NSArray *ls = self.layers.allObjects;
   if (!want) {
     if (self.shown) {
-      for (AVCaptureVideoPreviewLayer *l in ls) {
-        AVSampleBufferDisplayLayer *ov = objc_getAssociatedObject(l, kPCOverlay);
-        if (ov) { ov.hidden = YES; [ov flushAndRemoveImage]; }
+      for (CALayer *l in ls) {
+        CALayer *ov = objc_getAssociatedObject(l, kPCOverlay);
+        if (ov) { ov.hidden = YES; ov.contents = nil; }
       }
       self.shown = NO;
     }
@@ -1237,36 +1230,30 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
   if (!any) return;
   CIImage *raw = [E grabFrame];
   if (!raw || (self.shown && E.frameGen == self.lastGen)) return;   // rien de nouveau
+  CIImage *img = [E styled:raw upright:YES];
+  CGFloat m = MAX(img.extent.size.width, img.extent.size.height);
+  if (m > 960) img = [img imageByApplyingTransform:CGAffineTransformMakeScale(960 / m, 960 / m)];
+  CGImageRef cg = [E.ci createCGImage:img fromRect:img.extent format:kCIFormatBGRA8 colorSpace:PCSRGB()];
+  if (!cg) return;                                                   // pas d'image : on ne cache rien
   self.lastGen = E.frameGen;
-  CVPixelBufferRef pb = [E renderImage:[E styled:raw upright:YES] maxSide:1280];
-  if (!pb) return;
-  CMVideoFormatDescriptionRef fd = NULL; CMSampleBufferRef sb = NULL;
-  CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &fd);
-  CMSampleTimingInfo ti = {kCMTimeInvalid, CMClockGetTime(CMClockGetHostTimeClock()), kCMTimeInvalid};
-  if (fd) CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, fd, &ti, &sb);
-  if (fd) CFRelease(fd);
-  CVPixelBufferRelease(pb);
-  if (!sb) return;
-  CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, YES);
-  if (atts && CFArrayGetCount(atts)) CFDictionarySetValue((CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0), kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
   [CATransaction begin]; [CATransaction setDisableActions:YES];
   for (AVCaptureVideoPreviewLayer *l in ls) {
     if (!l.superlayer) continue;
-    AVSampleBufferDisplayLayer *ov = objc_getAssociatedObject(l, kPCOverlay);
+    CALayer *ov = objc_getAssociatedObject(l, kPCOverlay);
     if (!ov) {
-      ov = [AVSampleBufferDisplayLayer new];
+      ov = [CALayer new]; ov.masksToBounds = YES;
       objc_setAssociatedObject(l, kPCOverlay, ov, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (ov.superlayer != l) [l addSublayer:ov];
-    ov.zPosition = 10000; ov.hidden = NO;
-    ov.frame = l.bounds;
-    ov.videoGravity = [l respondsToSelector:@selector(videoGravity)] ? l.videoGravity : AVLayerVideoGravityResizeAspectFill;
+    NSString *g = [l respondsToSelector:@selector(videoGravity)] ? l.videoGravity : AVLayerVideoGravityResizeAspectFill;
+    ov.contentsGravity = [g isEqualToString:AVLayerVideoGravityResizeAspect] ? kCAGravityResizeAspect
+                       : [g isEqualToString:AVLayerVideoGravityResize] ? kCAGravityResize : kCAGravityResizeAspectFill;
+    ov.zPosition = 10000; ov.frame = l.bounds;
     ov.affineTransform = PCMirrored(l) ? CGAffineTransformMakeScale(-1, 1) : CGAffineTransformIdentity;   // texte lisible
-    if (ov.status == AVQueuedSampleBufferRenderingStatusFailed) [ov flush];
-    [ov enqueueSampleBuffer:sb];
+    ov.contents = (__bridge id)cg; ov.hidden = NO;
   }
   [CATransaction commit];
-  CFRelease(sb);
+  CGImageRelease(cg);
   self.shown = YES;
 }
 @end
