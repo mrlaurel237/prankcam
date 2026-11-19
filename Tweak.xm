@@ -16,6 +16,7 @@
 #import <poll.h>
 #import <unistd.h>
 #import <MediaToolbox/MediaToolbox.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
@@ -35,7 +36,15 @@ static NSString *PCDirPath(void) {   // dossier prive de l'app courante (le meme
 #define PC_ROT (M_PI_2)   // rotation video portrait -> buffer camera paysage (si l'image est encore a l'envers : mettre -M_PI_2)
 #define RING_N (1<<18)
 #define RING_MASK (RING_N-1)
+#define PC_MAXF 8192      // taille max d'un bloc audio traite
 
+static BOOL PCIsIOUnit(AudioUnit u) {   // unite d'entree micro (RemoteIO / VoiceProcessingIO)
+  AudioComponentDescription d;
+  AudioComponent c = AudioComponentInstanceGetComponent(u);
+  if (!c || AudioComponentGetDescription(c, &d) != noErr) return NO;
+  return d.componentType == kAudioUnitType_Output &&
+         (d.componentSubType == kAudioUnitSubType_RemoteIO || d.componentSubType == kAudioUnitSubType_VoiceProcessingIO);
+}
 static BOOL PCBool(id v, BOOL def) { return [v isKindOfClass:NSNumber.class] ? [v boolValue] : def; }
 static NSArray<NSString *> *PCVideos(void) {
   NSMutableArray *vids = [NSMutableArray new];
@@ -57,7 +66,7 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 }
 
 @interface PCEngine : NSObject {
-  CVPixelBufferRef _last; CIImage *_wm; CGSize _wmSize; BOOL _serverUp;
+  CVPixelBufferRef _last; CIImage *_wm; CGSize _wmSize; BOOL _wmTop; BOOL _serverUp;
   float *_ring; size_t _wp; double _rp; os_unfair_lock _lock;
   double _tapRate; UInt32 _tapCh; BOOL _tapNonInter;
   id _endObs;
@@ -91,6 +100,8 @@ static NSString *PCLocalIP(void) {   // adresse Wi-Fi de l'iPhone (pour la telec
 - (void)deleteVideo:(NSString *)f;
 - (CMSampleBufferRef)replace:(CMSampleBufferRef)sb CF_RETURNS_RETAINED;
 - (void)replaceAudio:(CMSampleBufferRef)sb;
+- (void)replaceAudioUnit:(AudioUnit)u abl:(AudioBufferList *)io frames:(UInt32)fr;
+- (void)pull:(float *)out frames:(UInt32)fr ratio:(double)ratio;
 @end
 
 static void tapInit(MTAudioProcessingTapRef t, void *ci, void **out) { *out = ci; }
@@ -158,7 +169,24 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   }
   os_unfair_lock_unlock(&_lock);
 }
-- (void)replaceAudio:(CMSampleBufferRef)sb {
+// preleve fr echantillons dans le tampon (reechantillonnes par interpolation lineaire) ; silence si pas assez de donnees.
+// La latence est plafonnee (~0,3 s) pour que le son reste cale sur l'image.
+- (void)pull:(float *)out frames:(UInt32)fr ratio:(double)ratio {
+  os_unfair_lock_lock(&_lock);
+  double rate = _tapRate > 0 ? _tapRate : 48000;
+  if ((double)_wp - _rp > rate * 0.3) _rp = (double)_wp - rate * 0.12;
+  BOOL have = ((double)_wp - _rp) >= fr * ratio + 2;
+  if (have) {
+    for (UInt32 i = 0; i < fr; i++) {
+      double pos = _rp + i * ratio; size_t i0 = (size_t)pos; float f = (float)(pos - (double)i0);
+      float a = _ring[i0 & RING_MASK], b = _ring[(i0 + 1) & RING_MASK];
+      out[i] = a + (b - a) * f;
+    }
+    _rp += fr * ratio;
+  } else memset(out, 0, fr * sizeof(float));      // rien a envoyer : silence (jamais le micro)
+  os_unfair_lock_unlock(&_lock);
+}
+- (void)replaceAudio:(CMSampleBufferRef)sb {       // chemin AVCaptureAudioDataOutput
   CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
   const AudioStreamBasicDescription *a = fd ? CMAudioFormatDescriptionGetStreamBasicDescription(fd) : NULL;
   CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
@@ -168,19 +196,45 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   UInt32 fr = (UInt32)CMSampleBufferGetNumSamples(sb), ch = a->mChannelsPerFrame;
   BOOL flt = (a->mFormatFlags & kAudioFormatFlagIsFloat) != 0, planar = (a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
   if (!((flt && a->mBitsPerChannel == 32) || (!flt && a->mBitsPerChannel == 16))) return;
-  double ratio = _tapRate / a->mSampleRate;
-  os_unfair_lock_lock(&_lock);
-  BOOL have = ((double)_wp - _rp) >= fr * ratio + 2;
+  if (!fr || fr > PC_MAXF || !ch) return;
+  float tmp[PC_MAXF];
+  [self pull:tmp frames:fr ratio:_tapRate / a->mSampleRate];
   for (UInt32 i = 0; i < fr; i++) {
-    float s = have ? _ring[((size_t)(_rp + i * ratio)) & RING_MASK] : 0;
+    float s = tmp[i];
     for (UInt32 c = 0; c < ch; c++) {
       size_t idx = planar ? (size_t)c * fr + i : (size_t)i * ch + c;
       if (flt) ((float *)p)[idx] = s;
       else ((int16_t *)p)[idx] = (int16_t)(MAX(-1.f, MIN(1.f, s)) * 32767);
     }
   }
-  if (have) _rp += fr * ratio;
-  os_unfair_lock_unlock(&_lock);
+}
+- (void)replaceAudioUnit:(AudioUnit)u abl:(AudioBufferList *)io frames:(UInt32)fr {   // chemin AudioUnit (WhatsApp, Messenger, appels WebRTC...)
+  if (!self.enabled || !self.audioOn || _tapRate <= 0) return;
+  if (!io || !io->mNumberBuffers || !fr || fr > PC_MAXF || !io->mBuffers[0].mData) return;
+  if (!PCIsIOUnit(u)) return;
+  static AudioUnit cu; static Float64 crate;
+  if (u != cu) {                                   // frequence d'echantillonnage du micro de cette unite
+    AudioStreamBasicDescription d; UInt32 sz = sizeof d;
+    if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &d, &sz) != noErr || d.mSampleRate <= 0) return;
+    crate = d.mSampleRate; cu = u;
+  }
+  UInt32 ch0 = io->mBuffers[0].mNumberChannels ?: 1;
+  UInt32 bps = io->mBuffers[0].mDataByteSize / fr / ch0;
+  if (bps != 2 && bps != 4) return;                // int16 ou float32 uniquement
+  float tmp[PC_MAXF];
+  [self pull:tmp frames:fr ratio:_tapRate / crate];
+  for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
+    AudioBuffer *ab = &io->mBuffers[b];
+    UInt32 ch = ab->mNumberChannels ?: 1;
+    if (!ab->mData || (size_t)fr * ch * bps > ab->mDataByteSize) continue;
+    for (UInt32 i = 0; i < fr; i++) {
+      float s = MAX(-1.f, MIN(1.f, tmp[i]));
+      for (UInt32 c = 0; c < ch; c++) {
+        if (bps == 4) ((float *)ab->mData)[i * ch + c] = s;
+        else ((int16_t *)ab->mData)[i * ch + c] = (int16_t)(s * 32767);
+      }
+    }
+  }
 }
 // ----- commandes de lecture -----
 - (void)setOn:(BOOL)on {                        // activation : icone flottante, panneau ou telecommande web
@@ -282,7 +336,8 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   return YES;
 }
 - (CIImage *)wmForSize:(CGSize)s {
-  if (_wm && CGSizeEqualToSize(_wmSize, s)) return _wm;
+  BOOL top = PCBool(_prefs[@"wm_top"], NO);
+  if (_wm && CGSizeEqualToSize(_wmSize, s) && top == _wmTop) return _wm;
   UIGraphicsBeginImageContextWithOptions(s, NO, 1);
   CGFloat fh = MAX(s.height * 0.028, 12);   // petit : ~3% de la hauteur
   NSShadow *sh = [NSShadow new]; sh.shadowColor = [UIColor colorWithWhite:0 alpha:0.6];
@@ -291,10 +346,10 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
                       NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.55],
                       NSShadowAttributeName: sh};
   CGSize ts = [PC_WM sizeWithAttributes:a];
-  [PC_WM drawAtPoint:CGPointMake((s.width - ts.width) / 2, s.height - ts.height - fh * 0.6) withAttributes:a];
+  [PC_WM drawAtPoint:CGPointMake((s.width - ts.width) / 2, top ? fh * 0.6 : s.height - ts.height - fh * 0.6) withAttributes:a];
   UIImage *im = UIGraphicsGetImageFromCurrentImageContext();
   UIGraphicsEndImageContext();
-  _wm = [[CIImage alloc] initWithImage:im]; _wmSize = s;
+  _wm = [[CIImage alloc] initWithImage:im]; _wmSize = s; _wmTop = top;
   return _wm;
 }
 - (CMSampleBufferRef)replace:(CMSampleBufferRef)sb {
@@ -325,6 +380,9 @@ static void tapProcess(MTAudioProcessingTapRef t, CMItemCount n, MTAudioProcessi
   }
   CGFloat dx = ((CGFloat)W - img.extent.size.width) / 2, dy = ((CGFloat)H - img.extent.size.height) / 2;
   img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
+  CIFilter *sh = [CIFilter filterWithName:@"CISharpenLuminance"];   // legere accentuation : compense le flou apres reduction
+  [sh setValue:img forKey:kCIInputImageKey]; [sh setValue:@0.4 forKey:kCIInputSharpnessKey];
+  img = sh.outputImage ?: img;
   CVPixelBufferRef dst = NULL;
   NSDictionary *at = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
   CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)at, &dst);
@@ -735,12 +793,15 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   [st addArrangedSubview:cs]; self.cueStack = cs;
   // reglages
   [st addArrangedSubview:PCLabel(@"Réglages", 15, YES)];
-  [st addArrangedSubview:PCRow(@"Son de la vidéo (sinon mon micro)", [self sw:E.audioOn action:@selector(swAudio:)])];
+  [st addArrangedSubview:PCRow(@"Micro coupé : n'envoyer que le son de la vidéo", [self sw:E.audioOn action:@selector(swAudio:)])];
   [st addArrangedSubview:PCRow(@"Repartir à 0 à chaque activation", [self sw:E.zeroOnActivate action:@selector(swZero:)])];
   [st addArrangedSubview:PCRow(@"Boucle (sinon reste sur la dernière image)", [self sw:E.loop action:@selector(swLoop:)])];
   [st addArrangedSubview:PCRow(@"Mini-télécommande flottante", [self sw:PCBool(E.prefs[@"mini"], YES) action:@selector(swMini:)])];
   [st addArrangedSubview:PCRow(@"Télécommande web (même Wi-Fi)", [self sw:E.webOn action:@selector(swWeb:)])];
   self.webLbl = [self hint:@""]; [st addArrangedSubview:self.webLbl]; [self refreshWeb];
+  UIButton *wb = PCBtn(@"", self, @selector(toggleWM:)); [self titleWM:wb];
+  [st addArrangedSubview:wb];
+  [st addArrangedSubview:PCRow(@"Qualité maximale (1080p, relance l'app)", [self sw:PCBool(E.prefs[@"hq"], YES) action:@selector(swHQ:)])];
   [st addArrangedSubview:PCBtn(@"Masquer les boutons (point discret)", self, @selector(hideAll))];
   [st addArrangedSubview:[self hint:@"Icône 🎥 : tap = ON/OFF · appui long = cette télécommande · glisser = déplacer.\n"
                                      "Bouton 0 : retour au début de la vidéo · appui long = début en pause.\n"
@@ -832,6 +893,16 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
 - (void)swAudio:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.audioOn = s.on; [E savePrefs]; }
 - (void)swZero:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.zeroOnActivate = s.on; [E savePrefs]; }
 - (void)swLoop:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.loop = s.on; [E savePrefs]; }
+- (void)titleWM:(UIButton *)b {
+  BOOL top = PCBool([PCEngine shared].prefs[@"wm_top"], NO);
+  [b setTitle:top ? @"Filigrane LIVE PRANK : en haut (toucher = en bas)" : @"Filigrane LIVE PRANK : en bas (toucher = en haut)" forState:UIControlStateNormal];
+}
+- (void)toggleWM:(UIButton *)b {                 // la position change, le filigrane reste toujours visible
+  PCEngine *E = [PCEngine shared];
+  E.prefs[@"wm_top"] = @(!PCBool(E.prefs[@"wm_top"], NO)); [E savePrefs];
+  [self titleWM:b];
+}
+- (void)swHQ:(UISwitch *)s { PCEngine *E = [PCEngine shared]; E.prefs[@"hq"] = @(s.on); [E savePrefs]; }
 - (void)swMini:(UISwitch *)s {
   PCEngine *E = [PCEngine shared]; E.prefs[@"mini"] = @(s.on); [E savePrefs];
   self.mini.hidden = !s.on;
@@ -942,5 +1013,31 @@ static void PCPatch(Class cls) {
   %orig;
 }
 %end
+
+static BOOL PCTargetApp(void) {
+  static BOOL r; static dispatch_once_t o;
+  dispatch_once(&o, ^{
+    NSString *b = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    r = [@[@"com.toyopagroup.picaboo", @"com.zhiliaoapp.musically", @"net.whatsapp.WhatsApp", @"net.whatsapp.WhatsAppSMB", @"com.facebook.Messenger"] containsObject:b];
+  });
+  return r;
+}
+%hook AVCaptureSession      // qualite maximale : prefere 1080p aux petits presets (si la camera le permet)
+- (void)setSessionPreset:(AVCaptureSessionPreset)preset {
+  if (PCTargetApp() && PCBool([PCEngine shared].prefs[@"hq"], YES) &&
+      ([preset isEqualToString:AVCaptureSessionPresetMedium] || [preset isEqualToString:AVCaptureSessionPresetLow] ||
+       [preset isEqualToString:AVCaptureSessionPreset640x480] || [preset isEqualToString:AVCaptureSessionPreset1280x720] ||
+       [preset isEqualToString:AVCaptureSessionPreset960x540]) &&
+      [self canSetSessionPreset:AVCaptureSessionPreset1920x1080]) { %orig(AVCaptureSessionPreset1920x1080); return; }
+  %orig;
+}
+%end
+
+// Apps qui lisent le micro via une AudioUnit (appels WhatsApp / Messenger, WebRTC...) : on remplace les echantillons du micro
+%hookf(OSStatus, AudioUnitRender, AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+  OSStatus r = %orig;
+  if (r == noErr && bus == 1) [[PCEngine shared] replaceAudioUnit:unit abl:io frames:frames];
+  return r;
+}
 
 %ctor { patched = [NSMutableSet new]; }
