@@ -954,10 +954,10 @@ static void PCHaptic(void) { [[[UIImpactFeedbackGenerator alloc] initWithStyle:U
   [st addArrangedSubview:PCLabel(@"Image", 15, YES)];
   [st addArrangedSubview:[self sliderRow:@"Saturation" min:0 max:1.5 value:E.saturation action:@selector(slSat:)]];
   [st addArrangedSubview:PCBtn(@"Couleurs d'origine (100 %)", self, @selector(resetSat))];
-  [st addArrangedSubview:PCLabel(@"Options avancées (désactivées par défaut)", 15, YES)];
-  [st addArrangedSubview:PCRow(@"Voir aussi la vidéo sur mon écran (aperçu caméra, appel vidéo)", [self sw:PCBool(E.prefs[@"preview"], NO) action:@selector(swPreview:)])];
+  [st addArrangedSubview:PCRow(@"Voir la vidéo sur mon écran (retour image, appel vidéo, appareil photo)", [self sw:PCBool(E.prefs[@"preview"], YES) action:@selector(swPreview:)])];
+  [st addArrangedSubview:PCLabel(@"Option avancée (désactivée par défaut)", 15, YES)];
   [st addArrangedSubview:PCRow(@"Remplacer aussi les photos et vidéos de l'appareil photo", [self sw:PCBool(E.prefs[@"capture"], NO) action:@selector(swCapture:)])];
-  [st addArrangedSubview:[self hint:@"Si un appel vidéo n'affiche plus que ta photo de profil : coupe ces deux options puis relance l'app."]];
+  [st addArrangedSubview:[self hint:@"Si un appel vidéo n'affiche plus que ta photo de profil chez l'autre : coupe cette option puis relance l'app."]];
   [st addArrangedSubview:PCLabel(@"Lecture", 15, YES)];
   [st addArrangedSubview:PCRow(@"Repartir à 0 à chaque activation", [self sw:E.zeroOnActivate action:@selector(swZero:)])];
   [st addArrangedSubview:PCRow(@"Boucle (sinon reste sur la dernière image)", [self sw:E.loop action:@selector(swLoop:)])];
@@ -1241,7 +1241,7 @@ static BOOL PCMirrored(CALayer *l) {          // l'app retourne-t-elle l'apercu 
 }
 - (void)tick {
   PCEngine *E = [PCEngine shared];
-  BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], NO);
+  BOOL want = E.enabled && E.out && PCBool(E.prefs[@"preview"], YES);
   NSArray *ls = self.layers.allObjects;
   if (!want) {                                     // OFF : on retire tout et on s'arrete (aucun effet sur l'app)
     for (CALayer *l in ls) {

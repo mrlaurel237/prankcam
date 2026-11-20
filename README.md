@@ -17,10 +17,8 @@ Tweak rootless (iOS 15+, Dopamine / palera1n, ElleKit ou Substrate) qui remplace
   - *Envoyer le son de la vidéo* (à la place du micro) + *Volume de la vidéo envoyée* (0 à 200 %).
   - *Ajouter ma voix* : envoie la vidéo + ton micro mélangés proprement (de préférence avec des écouteurs).
 - **Image** : les couleurs sont maintenant rendues en sRGB / BT.709 (avant, l'image sortait sans gestion des couleurs : trop contrastée et trop saturée ; les vidéos HDR de l'iPhone sont aussi converties correctement). Curseur *Saturation* + bouton *Couleurs d'origine*.
-- **Options avancées** (désactivées par défaut, car elles pouvaient empêcher les appels vidéo WhatsApp de recevoir l'image) :
-  - *Voir aussi la vidéo sur mon écran* : la vidéo s'affiche aussi dans l'aperçu (appareil photo, petite fenêtre « moi » en appel).
-  - *Remplacer aussi les photos et vidéos de l'appareil photo* : les hooks correspondants ne sont installés que si cette option est activée.
-  - Si un appel n'affiche que la photo de profil : coupe ces options et relance l'app.
+- **Retour image** : *Voir la vidéo sur mon écran* (activé par défaut) : quand la caméra prank est active, tu vois aussi la vidéo dans ton aperçu (petite fenêtre « moi » pendant un appel, appareil photo). Ça n'agit que sur l'affichage, pas sur la caméra.
+- **Option avancée** (désactivée par défaut) : *Remplacer aussi les photos et vidéos de l'appareil photo*. Ces hooks ne sont installés que si l'option est activée. Si un appel n'affiche plus que ta photo de profil chez l'autre, coupe-la et relance l'app.
 - **Télécommande web** (désactivée par défaut) : depuis un autre téléphone sur le même Wi-Fi, ouvre l'adresse affichée dans les réglages (`http://IP-de-l-iPhone:8765`).
 
 Les vidéos, les repères et les réglages sont gardés dans le dossier `PrankCam` de l'app, donc les vidéos déjà importées avec PrankCam restent disponibles.
